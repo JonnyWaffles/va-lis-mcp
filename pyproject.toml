@@ -1,0 +1,55 @@
+[project]
+name = "va-lis-mcp"
+version = "0.1.0"
+description = "MCP server for the Virginia Legislative Information System (LIS) API"
+readme = "README.md"
+license = { text = "MIT" }
+requires-python = ">=3.10"
+authors = [{ name = "Jonny Fuller", email = "mr.waffles@gmail.com" }]
+keywords = ["virginia", "legislature", "LIS", "legislation", "API", "MCP", "model context protocol"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Software Development :: Libraries",
+]
+dependencies = [
+    "mcp>=2,<3",
+    "va-lis-client>=0.1.1,<0.2",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest",
+    "pytest-asyncio",
+    "ruff",
+]
+
+[project.scripts]
+va-lis-mcp = "va_lis_mcp.server:main"
+
+[project.urls]
+Homepage = "https://github.com/JonnyWaffles/va-lis-mcp"
+Repository = "https://github.com/JonnyWaffles/va-lis-mcp"
+"Bug Tracker" = "https://github.com/JonnyWaffles/va-lis-mcp/issues"
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+asyncio_mode = "auto"
+
+[tool.ruff]
+line-length = 100
+lint.select = ["E", "F", "B", "I"]
+lint.extend-select = ["I"]
+fix = true

@@ -1,8 +1,17 @@
 """MCP server exposing the Virginia Legislative Information System (LIS) API.
 
-Wraps :mod:`va_lis_client` with eight read-only tools shaped for LLM
-consumption: human identifiers in (bill number + session code), compact JSON
-out, HTML stripped from bill text and summaries.
+Wraps :class:`va_lis_client.LISService` with read-only tools shaped for LLM
+consumption: human identifiers in (bill number + session code, member id,
+committee number or name), compact JSON out, HTML stripped from bill text,
+summaries, and agendas. Bill number normalization, id resolution, the
+reference joins (roster, statuses), and every cache live in the service; this
+module defines the tools, and :mod:`va_lis_mcp._shaping` turns the models they
+get back into the compact dicts they return.
+
+The tools cover bills (list, detail, summaries, text, history, patrons),
+votes (per bill with the roll call, and per member), members with their
+bills and committee seats, committees with their rosters, and meetings (the
+master schedule, Senate dockets, and floor calendars).
 
 Run over stdio (the transport MCP hosts launch)::
 
@@ -13,40 +22,82 @@ or serve over HTTP with the ASGI app in :mod:`va_lis_mcp.asgi`.
 
 from __future__ import annotations
 
-import re
-import time
 from collections.abc import Callable
-from datetime import datetime
-from html.parser import HTMLParser
-from typing import Any
+from typing import Any, Literal
 
 from mcp.server import MCPServer
-from va_lis_client import LISClient, LISClientError
-from va_lis_client.models import (
-    Legislation,
-    LegislationEventType,
-    LegislationStatus,
-    LegislationSummaryItem,
-    LegislationTextItem,
-    Patron,
-    Session,
+from va_lis_client import (
+    LISClient,
+    LISClientError,
+    LISService,
+    normalize_bill_number,
+    strip_html,
+)
+from va_lis_client.models import CHIEF_PATRON, PATRON_ROLES, Member
+
+from va_lis_mcp._shaping import (
+    RESPONSE_LABELS,
+    compact_bill_row,
+    compact_bill_vote,
+    compact_committee,
+    compact_committee_member,
+    compact_docket_item,
+    compact_meeting,
+    compact_member,
+    compact_member_bill,
+    compact_member_vote,
+    compact_patron,
+    compact_seat,
+    compact_session,
+    compact_voter,
+    condense_patrons,
+    docket_header,
+    drop_empty,
+    iso,
+    matches,
+    paginate,
+    parse_date,
+    roll_call_header,
 )
 
 _REGISTRATION_URL = "https://lis.virginia.gov/apiregistration"
 _TEXT_CHAR_LIMIT = 15_000
-_MAX_LIST_LIMIT = 200
-_BILL_LIST_TTL_SECONDS = 15 * 60
-_BILL_NUMBER_RE = re.compile(r"([A-Z]+)(\d+)")
+
+# An event's resulting Status (a closed 52-name vocabulary) is the reliable
+# passage signal. The event type reference's IsPassage flag is not: LIS reuses
+# one EventCode for both the "passed" and the "defeated" outcome of a floor
+# vote (verified live 2026-09-08, e.g. H5000), so the code alone cannot mark
+# passage.
+_PASSAGE_STATUSES = {"Passed", "Passed House", "Passed Senate", "Passed Both"}
+
+# ScheduleTypeID behind each schedule type name.
+_MEETING_TYPE_IDS = {
+    "Committee": 1,
+    "Chamber": 2,
+    "Conference": 3,
+    "Caucus": 4,
+    "Other": 5,
+    "Docket": 6,
+}
+
+# Patron role name -> PatronTypeID, the reverse of the client's vocabulary.
+_PATRON_ROLE_IDS = {name: role_id for role_id, name in PATRON_ROLES.items()}
 
 _INSTRUCTIONS = """\
 Read-only tools for the Virginia General Assembly's Legislative Information
-System (LIS): sessions, bills, summaries, full bill text, and action history.
+System (LIS): sessions, bills, summaries, full bill text, action history,
+votes and roll calls, members, committees, and meetings.
 
 Identifiers:
 - session_code encodes year + sequence: 20261 = 2026 Regular Session,
   20262 = 2026 Special Session I. Use list_sessions to discover codes.
 - Bill numbers are unpadded: HB1, not HB0001. Tools normalize input
   (hb0001 -> HB1) before querying.
+- member_id is LIS's stable id for a person. Get one from list_members
+  (search by name), a roll call, or a patron list.
+- Committees are addressed by number ("H08", "S13") or by name ("Courts of
+  Justice"). Both chambers have some names, so pass the chamber or the number
+  when a name is ambiguous.
 
 Session semantics:
 - get_current_session returns the GA's *working* session. During the interim
@@ -58,19 +109,48 @@ Session semantics:
   (session_code, bill_number); the numeric ID alone is ambiguous across the
   pair. get_bill's "sessions" list is the carry-over lineage record.
 
+Voting records:
+- get_bill_votes lists every vote a bill saw (floor, committee, and
+  subcommittee, in both chambers); get_roll_call names the members with party
+  and district; get_member_votes is the same record from the member's side.
+- A block vote is one motion that disposes of many uncontroversial bills at
+  once, and a voice vote records no members. Neither is a member's verdict on
+  one bill, so get_roll_call leaves them out and get_member_votes flags them
+  with is_block. Response "not_voting" (LIS code X) is omitted from tally
+  strings, so member groups never sum to the tally.
+- Vote statements are corrections a member filed ("recorded as yea, intended
+  to vote nay"); the recorded roll call itself is never amended.
+
+Members and committees:
+- The session roster deliberately includes members who left or arrived
+  mid-session; they cast the votes recorded before they left.
+- The committee list is not session scoped; committee membership is.
+- LIS has no "bills referred to a committee" endpoint. Read a bill's
+  committee from get_bill_history.
+
+Meetings:
+- Schedule times are free text ("15 minutes after adjournment") and may be
+  blank. Cancelled meetings stay listed with cancelled true.
+- Dockets (committee agendas) exist for Senate committees only; House
+  committee agendas are not in the API. Floor calendars cover both chambers.
+
 All data comes from the live LIS REST API and requires the LIS_API_KEY
 environment variable (register at https://lis.virginia.gov/apiregistration).
 Use check_api_key to verify the key: LIS heartbeat endpoints accept any key,
 so a working heartbeat proves nothing.
 """
 
-# In-process caches: bill lists are thousands of rows and three tools need
-# them for id resolution; the reference lists are static vocabularies.
-_bill_list_cache: dict[int, tuple[float, list[LegislationSummaryItem]]] = {}
-_event_type_index: dict[str, LegislationEventType] | None = None
-_status_index: tuple[dict[str, LegislationStatus], dict[int, LegislationStatus]] | None = None
+# Built lazily on the first tool call; the service owns every cache (session
+# bill lists, rosters, seat lists, dockets, and the static vocabularies), so
+# one instance serves the whole process.
+_service: LISService | None = None
 
 mcp = MCPServer("va-lis", instructions=_INSTRUCTIONS)
+
+
+# ----------------------------------------------------------------------------
+# Sessions
+# ----------------------------------------------------------------------------
 
 
 @mcp.tool()
@@ -82,12 +162,12 @@ def get_current_session() -> dict[str, Any]:
     retrospective work on a finished session, pass that session's code to the
     other tools instead of relying on this default.
     """
-    session = _call(_get_client().get_default_session)
+    session = _call(_get_service().client.get_default_session)
 
     if session is None:
         raise RuntimeError("LIS did not report a default session.")
 
-    payload = _compact_session(session)
+    payload = compact_session(session)
     payload["note"] = (
         "This is the GA's working session. During the interim it is the upcoming "
         "session, not the one that just ended; pass an explicit session_code for "
@@ -103,9 +183,14 @@ def list_sessions(year: int) -> dict[str, Any]:
     Returns each session's code, e.g. 20261 = 2026 Regular Session and
     20262 = 2026 Special Session I. The reference list reaches back to 1994.
     """
-    sessions = _call(_get_client().get_sessions, year)
+    sessions = _call(_get_service().client.get_sessions, year)
 
-    return {"year": year, "sessions": [_compact_session(s) for s in sessions]}
+    return {"year": year, "sessions": [compact_session(s) for s in sessions]}
+
+
+# ----------------------------------------------------------------------------
+# Bills
+# ----------------------------------------------------------------------------
 
 
 @mcp.tool()
@@ -122,28 +207,24 @@ def list_bills(
     result sets with ``offset``. ``total_matching`` counts all matches, not
     just the returned page.
     """
-    bills = _session_bills(session_code)
+    bills = _call(_get_service().session_bills, session_code)
 
     if query:
         needle = query.strip().lower()
         bills = [
             bill
             for bill in bills
-            if needle in bill.LegislationNumber.lower()
-            or needle in (bill.Description or "").lower()
-            or needle in (bill.LegislationTitle or "").lower()
+            if matches(needle, bill.LegislationNumber, bill.Description, bill.LegislationTitle)
         ]
 
-    limit = max(1, min(limit, _MAX_LIST_LIMIT))
-    offset = max(0, offset)
-    page = bills[offset : offset + limit]
+    page, offset = paginate(bills, limit, offset)
 
     return {
         "session_code": session_code,
         "total_matching": len(bills),
         "count": len(page),
         "offset": offset,
-        "bills": [_compact_bill_row(bill) for bill in page],
+        "bills": [compact_bill_row(bill) for bill in page],
     }
 
 
@@ -151,20 +232,15 @@ def list_bills(
 def get_bill(bill_number: str, session_code: int) -> dict[str, Any]:
     """Full detail for one bill: title, status, dates, patrons, session lineage.
 
-    ``patrons`` groups member names by role (Chief Patron, Co-Patron, ...).
-    ``sessions`` lists every session the bill appears in; two entries mean it
-    was carried over from the even-year session into the odd-year session.
+    ``patrons`` groups member names by role (Chief Patron, Co-Patron, ...);
+    get_bill_patrons returns the same list with member ids. ``sessions``
+    lists every session the bill appears in; two entries mean it was carried
+    over from the even-year session into the odd-year session.
     """
-    item = _resolve_bill(bill_number, session_code)
-    bill = _call(_get_client().get_bill, item.LegislationID)
+    service = _get_service()
+    bill = _call(service.get_bill, bill_number, session_code)
 
-    if bill is None:
-        raise ValueError(
-            f"Bill {item.LegislationNumber} (LegislationID {item.LegislationID}) "
-            "has no detail record in LIS."
-        )
-
-    return _drop_empty(
+    return drop_empty(
         {
             "legislation_id": bill.LegislationID,
             "bill_number": bill.LegislationNumber,
@@ -172,16 +248,36 @@ def get_bill(bill_number: str, session_code: int) -> dict[str, Any]:
             "title": bill.LegislationTitle,
             "chamber": bill.ChamberCode,
             "type": bill.LegislationTypeCode,
-            "status": _status_display(bill, item),
-            "introduction_date": _iso(bill.IntroductionDate),
-            "offered_date": _iso(bill.OfferedDate),
+            "status": _call(service.bill_status_label, bill),
+            "introduction_date": iso(bill.IntroductionDate),
+            "offered_date": iso(bill.OfferedDate),
             "sessions": [
                 {"session_code": int(s.SessionCode), "is_prefile": s.IsPrefile}
                 for s in bill.Sessions
             ],
-            "patrons": _condense_patrons(bill.Patrons),
+            "patrons": condense_patrons(bill.Patrons),
         }
     )
+
+
+@mcp.tool()
+def get_bill_patrons(bill_number: str, session_code: int) -> dict[str, Any]:
+    """Every patron of a bill with their member ids, in LIS display order.
+
+    ``role`` is Chief Patron, Chief Co-Patron, or Co-Patron. ``member_id``
+    chains into get_member, get_member_bills, get_member_votes, and
+    get_member_committees. get_bill lists the same names grouped by role,
+    without ids.
+    """
+    number = normalize_bill_number(bill_number)
+    patrons = _call(_get_service().bill_patrons, number, session_code)
+
+    return {
+        "bill_number": number,
+        "session_code": session_code,
+        "count": len(patrons),
+        "patrons": [compact_patron(p) for p in patrons],
+    }
 
 
 @mcp.tool()
@@ -191,9 +287,9 @@ def get_bill_summaries(bill_number: str, session_code: int) -> dict[str, Any]:
     The entry with ``is_active`` true is the current summary. An empty list
     means LIS has published no summary for that bill and session.
     """
-    number = _normalize_bill_number(bill_number)
+    number = normalize_bill_number(bill_number)
     summaries = _call(
-        _get_client().get_bill_summaries,
+        _get_service().client.get_bill_summaries,
         legislation_number=number,
         session_code=session_code,
     )
@@ -202,12 +298,12 @@ def get_bill_summaries(bill_number: str, session_code: int) -> dict[str, Any]:
         "bill_number": number,
         "session_code": session_code,
         "summaries": [
-            _drop_empty(
+            drop_empty(
                 {
                     "version": summary.SummaryVersion,
-                    "date": _iso(summary.SummaryDate),
+                    "date": iso(summary.SummaryDate),
                     "is_active": summary.IsActive,
-                    "summary": _strip_html(summary.Summary) if summary.Summary else None,
+                    "summary": strip_html(summary.Summary) if summary.Summary else None,
                 }
             )
             for summary in summaries
@@ -215,7 +311,11 @@ def get_bill_summaries(bill_number: str, session_code: int) -> dict[str, Any]:
     }
 
 
-@mcp.tool()
+# structured_output=False drops the duplicate structuredContent copy: an output
+# schema makes the SDK send the payload twice, and bill text runs to 15,000
+# characters. The same JSON still ships as text in content. The other large
+# payloads (roll calls, voting records, rosters, schedules) do the same.
+@mcp.tool(structured_output=False)
 def get_bill_text(
     bill_number: str,
     session_code: int,
@@ -230,44 +330,24 @@ def get_bill_text(
     Amendment markup (additions and strikethrough deletions) is flattened
     to plain text.
     """
-    number = _normalize_bill_number(bill_number)
-    texts = _call(
-        _get_client().get_bill_texts,
-        legislation_number=number,
-        session_code=session_code,
-    )
-
-    if not texts:
-        raise ValueError(
-            f"No text versions found for {number} in session {session_code}. "
-            "Check the bill number and session code."
-        )
+    number = normalize_bill_number(bill_number)
+    service = _get_service()
+    texts = _call(service.bill_text_versions, number, session_code)
 
     versions = [
-        _drop_empty(
+        drop_empty(
             {
                 "document_code": t.DocumentCode,
                 "version": t.Version or t.Description,
-                "date": _iso(t.DraftDate),
+                "date": iso(t.DraftDate),
             }
         )
         for t in texts
     ]
-    selected = _pick_text_version(texts, document_code)
 
-    details = _call(
-        _get_client().get_bill_text_detail,
-        legislation_id=selected.LegislationID,
-        session_code=session_code,
-    )
-    detail = next((d for d in details if d.LegislationTextID == selected.LegislationTextID), None)
+    selected, detail = _call(service.bill_text, number, session_code, document_code, versions=texts)
 
-    if detail is None or not detail.DraftText:
-        raise ValueError(
-            f"LIS returned no text body for {selected.DocumentCode} in session {session_code}."
-        )
-
-    text = _strip_html(detail.DraftText)
+    text = strip_html(detail.DraftText)
     truncated = len(text) > _TEXT_CHAR_LIMIT
     if truncated:
         text = text[:_TEXT_CHAR_LIMIT]
@@ -289,42 +369,575 @@ def get_bill_history(bill_number: str, session_code: int) -> dict[str, Any]:
 
     Passage dates live here (the bill detail's passage date fields are always
     null in LIS): look for events with ``is_passage`` true and read ``date``
-    and ``vote_tally``. ``status`` is the bill's status after each event.
+    and ``vote_tally``. ``is_passage`` marks the events whose resulting
+    status is a passage status (Passed House, Passed Senate, ...). ``status``
+    is the bill's status after each event. ``committee`` names the committee
+    that acted; this is the only place LIS records which committee holds a
+    bill. ``vote_id`` links an event to its vote: pass it to get_roll_call.
     """
-    item = _resolve_bill(bill_number, session_code)
-    events = _call(_get_client().get_bill_events, item.LegislationID)
+    number = normalize_bill_number(bill_number)
+    service = _get_service()
+    legislation_id = _call(service.resolve_bill_id, number, session_code)
+    events = _call(service.client.get_bill_events, legislation_id)
 
-    event_types = _event_types_by_code()
-    statuses = _statuses_by_name()
+    statuses = _call(service.statuses_by_name)
 
     entries = []
     for event in events:
-        event_type = event_types.get(event.EventCode) if event.EventCode else None
         status = statuses.get(event.Status) if event.Status else None
         entries.append(
-            _drop_empty(
+            drop_empty(
                 {
-                    "date": _iso(event.EventDate),
-                    "description": event.Description
-                    or (event_type.LegislationDescription if event_type else None),
+                    "date": iso(event.EventDate),
+                    "description": event.Description,
                     "actor": event.ActorType,
                     "committee": event.CommitteeName,
                     "vote_tally": event.VoteTally,
+                    "vote_id": event.VoteID,
                     "status": status.DisplayName if status else event.Status,
                     # Only flag passage events; omitting the key on the rest
                     # keeps the timeline compact.
-                    "is_passage": (event_type.IsPassage or None) if event_type else None,
+                    "is_passage": (event.Status in _PASSAGE_STATUSES) or None,
                 }
             )
         )
 
     return {
-        "bill_number": item.LegislationNumber,
+        "bill_number": number,
         "session_code": session_code,
-        "legislation_id": item.LegislationID,
+        "legislation_id": legislation_id,
         "count": len(entries),
         "events": entries,
     }
+
+
+# ----------------------------------------------------------------------------
+# Votes
+# ----------------------------------------------------------------------------
+
+
+@mcp.tool()
+def get_bill_votes(bill_number: str, session_code: int) -> dict[str, Any]:
+    """Every recorded vote on a bill, in both chambers, in chronological order.
+
+    Floor, committee, and subcommittee votes all appear. ``is_roll_call`` is
+    true when the recorded members voted on this bill alone; it is false for
+    a voice vote (no members recorded) and for a block vote (one motion that
+    disposed of ``bills_in_vote`` bills at once, which is not a position on
+    any one of them). Pass a ``vote_id`` to get_roll_call for the member by
+    member record. Costs one request per vote.
+    """
+    number = normalize_bill_number(bill_number)
+    records = _call(_get_service().bill_votes, number, session_code)
+
+    return {
+        "bill_number": number,
+        "session_code": session_code,
+        "count": len(records),
+        "votes": [compact_bill_vote(record) for record in records],
+    }
+
+
+@mcp.tool(structured_output=False)
+def get_roll_call(
+    bill_number: str,
+    session_code: int,
+    vote_id: int | None = None,
+) -> dict[str, Any]:
+    """Who voted which way on a bill, with party and district, one entry per vote.
+
+    Members are grouped under ``yea``, ``nay``, ``abstain``, and
+    ``not_voting``. ``statements`` are corrections members filed ("recorded
+    as yea. Intended to vote nay."); the recorded response still stands. Only
+    votes that record members on this bill alone are included: voice votes
+    and block votes are left out (get_bill_votes lists those too).
+    ``vote_id`` narrows the result to one vote.
+    """
+    number = normalize_bill_number(bill_number)
+    entries = _call(_get_service().roll_call, number, session_code, vote_id=vote_id)
+
+    roll_calls: dict[int, dict[str, Any]] = {}
+    for entry in entries:
+        label = RESPONSE_LABELS.get(entry.response or "")
+        if label is None:
+            continue
+
+        payload = roll_calls.get(entry.vote.VoteID)
+        if payload is None:
+            payload = roll_calls[entry.vote.VoteID] = roll_call_header(entry.vote)
+
+        payload.setdefault(label, []).append(compact_voter(entry))
+
+    result: dict[str, Any] = {
+        "bill_number": number,
+        "session_code": session_code,
+        "count": len(roll_calls),
+        "roll_calls": list(roll_calls.values()),
+    }
+    if not roll_calls:
+        result["note"] = (
+            "No attributable roll call. Voice votes record no members and block "
+            "votes record positions on a bundle of bills, not on this one; "
+            "get_bill_votes lists every vote with those flags."
+        )
+
+    return result
+
+
+@mcp.tool(structured_output=False)
+def get_member_votes(
+    member_id: int,
+    session_code: int,
+    bill_number: str | None = None,
+    exclude_block_votes: bool = False,
+    limit: int = 50,
+    offset: int = 0,
+) -> dict[str, Any]:
+    """Every vote one member cast in a session, or their votes on one bill.
+
+    Floor, committee, and subcommittee votes all appear, in LIS order. A row
+    is one (vote, bill) pair: a block vote that disposed of 105 bills appears
+    105 times, each with ``is_block`` true and ``bills_in_vote`` set. A block
+    vote is a real vote, but not a considered position on any one bill;
+    ``exclude_block_votes`` drops them. ``total_matching`` counts rows and
+    ``distinct_votes`` counts votes cast. Attendance roll calls are omitted.
+    ``limit`` is capped at 200; page with ``offset``.
+    """
+    service = _get_service()
+    member = _roster_member(service, member_id, session_code)
+
+    if bill_number is not None:
+        number = normalize_bill_number(bill_number)
+        votes = _call(service.member_votes_on, member_id, number, session_code)
+    else:
+        number = None
+        votes = _call(service.member_votes, member_id, session_code)
+
+    if exclude_block_votes:
+        votes = [vote for vote in votes if not vote.is_block]
+
+    page, offset = paginate(votes, limit, offset)
+
+    payload: dict[str, Any] = {
+        "member_id": member_id,
+        "member": member.name,
+        "session_code": session_code,
+    }
+    if number is not None:
+        payload["bill_number"] = number
+
+    payload.update(
+        {
+            "total_matching": len(votes),
+            "distinct_votes": len({vote.result.VoteID for vote in votes}),
+            "count": len(page),
+            "offset": offset,
+            "votes": [compact_member_vote(vote) for vote in page],
+        }
+    )
+    return payload
+
+
+# ----------------------------------------------------------------------------
+# Members
+# ----------------------------------------------------------------------------
+
+
+@mcp.tool(structured_output=False)
+def list_members(
+    session_code: int,
+    query: str | None = None,
+    chamber: Literal["H", "S"] | None = None,
+) -> dict[str, Any]:
+    """The session's member roster, searchable by name.
+
+    ``query`` matches any part of a name, ignoring case ("schmidt",
+    "Charlie Schmidt", "Schmidt, C"); omit it for the whole roster. The
+    roster deliberately includes members who left or arrived mid-session
+    (``service_end_date`` and ``service_end_reason`` mark a departure): they
+    cast the votes recorded before they left. ``member_id`` is the key for
+    the member tools.
+    """
+    service = _get_service()
+
+    if query:
+        members = _call(service.find_members, query, session_code)
+    else:
+        roster = _call(service.members_by_id, session_code)
+        members = sorted(roster.values(), key=lambda m: (m.list_name or m.name).lower())
+
+    if chamber:
+        members = [member for member in members if member.ChamberCode == chamber]
+
+    return {
+        "session_code": session_code,
+        "count": len(members),
+        "members": [compact_member(member) for member in members],
+    }
+
+
+@mcp.tool()
+def get_member(member_id: int, session_code: int) -> dict[str, Any]:
+    """One member's roster record: name, chamber, party, district, status, contact.
+
+    Reads the session roster, which is the authoritative source (LIS's by-id
+    endpoint answers nothing for some sitting members). Use
+    get_member_committees for seats, get_member_bills for patronage, and
+    get_member_votes for the voting record.
+    """
+    member = _roster_member(_get_service(), member_id, session_code)
+
+    return drop_empty(
+        {
+            "session_code": session_code,
+            **compact_member(member),
+            "service_begin_date": iso(member.ServiceBeginDate),
+            "email": member.email or None,
+            "phone": member.GABPhoneNumber,
+            "room": member.RoomNumber,
+        }
+    )
+
+
+@mcp.tool(structured_output=False)
+def get_member_bills(
+    member_id: int,
+    session_code: int,
+    role: Literal["Chief Patron", "Chief Co-Patron", "Co-Patron"] | None = None,
+    query: str | None = None,
+    limit: int = 50,
+    offset: int = 0,
+) -> dict[str, Any]:
+    """Every bill a member patrons in a session, in any role.
+
+    The session bill list names only chief patrons, so this is the route to
+    a member's co-patronage. ``is_chief_patron`` marks the bills the member
+    sponsors; ``role`` restricts the list to one role. ``query`` is a
+    case-insensitive substring match against the bill number, description,
+    and title. ``limit`` is capped at 200; page with ``offset``.
+    """
+    service = _get_service()
+    member = _roster_member(service, member_id, session_code)
+
+    role_id = _PATRON_ROLE_IDS[role] if role else None
+    bills = _call(service.member_bills, member_id, session_code, role=role_id)
+
+    if role is None:
+        chief = _call(service.member_bills, member_id, session_code, role=CHIEF_PATRON)
+        chief_ids = {bill.LegislationID for bill in chief}
+    elif role_id == CHIEF_PATRON:
+        chief_ids = {bill.LegislationID for bill in bills}
+    else:
+        chief_ids = set()
+
+    if query:
+        needle = query.strip().lower()
+        bills = [
+            bill
+            for bill in bills
+            if matches(needle, bill.LegislationNumber, bill.Description, bill.LegislationTitle)
+        ]
+
+    page, offset = paginate(bills, limit, offset)
+
+    payload: dict[str, Any] = {
+        "member_id": member_id,
+        "member": member.name,
+        "session_code": session_code,
+    }
+    if role is not None:
+        payload["role"] = role
+
+    payload.update(
+        {
+            "total_matching": len(bills),
+            "count": len(page),
+            "offset": offset,
+            "bills": [compact_member_bill(bill, bill.LegislationID in chief_ids) for bill in page],
+        }
+    )
+    return payload
+
+
+@mcp.tool()
+def get_member_committees(
+    member_id: int,
+    session_code: int,
+    include_subcommittees: bool = False,
+) -> dict[str, Any]:
+    """Every committee seat one member holds in a session, with the role.
+
+    LIS has no member-first committee endpoint, so this reads every seat
+    list in the member's chamber: 14 requests cold for a House member, 67
+    with subcommittees, all cached afterwards.
+    """
+    service = _get_service()
+    member = _roster_member(service, member_id, session_code)
+    seats = _call(
+        service.member_committees,
+        member_id,
+        session_code,
+        include_subcommittees=include_subcommittees,
+    )
+
+    return {
+        "member_id": member_id,
+        "member": member.name,
+        "session_code": session_code,
+        "count": len(seats),
+        "seats": [compact_seat(seat) for seat in seats],
+    }
+
+
+# ----------------------------------------------------------------------------
+# Committees
+# ----------------------------------------------------------------------------
+
+
+@mcp.tool()
+def list_committees(
+    chamber: Literal["H", "S"] | None = None,
+    include_subcommittees: bool = False,
+) -> dict[str, Any]:
+    """The standing committees of one or both chambers, optionally with subcommittees.
+
+    The list is not session scoped: it describes the committees that exist
+    now. Who sits on them is session scoped; see get_committee. Use a
+    committee's ``number`` ("H08") or name with get_committee, list_meetings,
+    and list_dockets.
+    """
+    committees = _call(
+        _get_service().committees,
+        chamber,
+        include_subcommittees=include_subcommittees,
+    )
+
+    return {
+        "count": len(committees),
+        "committees": [compact_committee(committee) for committee in committees],
+    }
+
+
+@mcp.tool()
+def get_committee(
+    committee: str,
+    session_code: int,
+    chamber: Literal["H", "S"] | None = None,
+) -> dict[str, Any]:
+    """A committee's roster for a session: each member's role, party, and district.
+
+    ``committee`` is a number ("H08", "S13") or any part of a name ("Courts
+    of Justice", "courts"). Both chambers have some names, so pass
+    ``chamber`` or the number when a name is ambiguous. Seats come back in
+    LIS order, chair first. ``meeting_note`` is the committee's regular
+    meeting time when LIS records one, and ``subcommittees`` lists the
+    subcommittees, which this tool accepts by number too.
+    """
+    service = _get_service()
+    found = _call(service.resolve_committee, committee, chamber)
+    seats = _call(service.committee_members, found.CommitteeID, session_code)
+
+    subcommittees = [
+        row
+        for row in _call(service.committees, found.ChamberCode, include_subcommittees=True)
+        if row.ParentCommitteeID == found.CommitteeID
+    ]
+
+    # The list nulls MeetingNote; only the by-id call fills it.
+    session_id = _call(service.session_id, session_code)
+    detail = _call(service.client.get_committee, found.CommitteeID, session_id)
+
+    payload = compact_committee(found)
+    payload["session_code"] = session_code
+    if detail is not None and detail.MeetingNote:
+        payload["meeting_note"] = detail.MeetingNote
+
+    payload["count"] = len(seats)
+    payload["members"] = [compact_committee_member(seat) for seat in seats]
+    if subcommittees:
+        payload["subcommittees"] = [
+            {"committee_id": row.CommitteeID, "number": row.CommitteeNumber, "name": row.name}
+            for row in subcommittees
+        ]
+
+    return payload
+
+
+# ----------------------------------------------------------------------------
+# Meetings
+# ----------------------------------------------------------------------------
+
+
+@mcp.tool(structured_output=False)
+def list_meetings(
+    start_date: str,
+    end_date: str,
+    committee: str | None = None,
+    chamber: Literal["H", "S"] | None = None,
+    meeting_type: Literal["Committee", "Chamber", "Conference", "Caucus", "Docket", "Other"]
+    | None = None,
+    limit: int = 100,
+    offset: int = 0,
+) -> dict[str, Any]:
+    """Meetings on the master schedule in a date range: committees, floor, caucuses.
+
+    Dates are ``YYYY-MM-DD`` and inclusive; keep the range short, since a
+    week in session is about 150 meetings. ``committee`` narrows the list to
+    one committee by number or name (``chamber`` disambiguates a name found
+    in both chambers). ``time`` is free text as the clerk entered it ("15
+    minutes after adjournment") and may be blank. Cancelled meetings stay
+    listed with ``cancelled`` true. ``limit`` is capped at 200; page with
+    ``offset``.
+    """
+    start = parse_date(start_date, "start_date")
+    end = parse_date(end_date, "end_date")
+    if end < start:
+        raise ValueError("end_date must not be before start_date.")
+
+    service = _get_service()
+    owner_id = None
+    if committee:
+        owner_id = _call(service.resolve_committee, committee, chamber).CommitteeID
+
+    meetings = _call(
+        service.client.get_schedules,
+        start,
+        end,
+        owner_id=owner_id,
+        schedule_type_id=_MEETING_TYPE_IDS[meeting_type] if meeting_type else None,
+    )
+    meetings = sorted(meetings, key=lambda m: (m.ScheduleDate is None, m.ScheduleDate))
+
+    page, offset = paginate(meetings, limit, offset)
+
+    return {
+        "start_date": start.isoformat(),
+        "end_date": end.isoformat(),
+        "total_matching": len(meetings),
+        "count": len(page),
+        "offset": offset,
+        "meetings": [compact_meeting(meeting) for meeting in page],
+    }
+
+
+@mcp.tool(structured_output=False)
+def list_dockets(committee: str, session_code: int) -> dict[str, Any]:
+    """A Senate committee's dockets for a session: each meeting and the bills on it.
+
+    Dockets are the Senate's committee agendas, newest first as LIS lists
+    them. The House keeps none in the API: read a House bill's committee from
+    get_bill_history and the committee's meetings from list_meetings.
+    ``committee`` is a Senate committee number ("S13") or name. A docket and
+    its linked schedule can disagree on the hour, so both times are reported.
+    Costs one request per docket cold, cached afterwards.
+    """
+    service = _get_service()
+    found = _call(service.resolve_committee, committee, "S")
+    entries = _call(service.docket_entries, found.CommitteeID, session_code)
+
+    dockets: dict[int, dict[str, Any]] = {}
+    for entry in entries:
+        payload = dockets.get(entry.docket.DocketID)
+        if payload is None:
+            payload = dockets[entry.docket.DocketID] = docket_header(entry.docket)
+
+        payload["bills"].append(compact_docket_item(entry.item))
+
+    return {
+        "committee_id": found.CommitteeID,
+        "committee_number": found.CommitteeNumber,
+        "committee": found.name,
+        "session_code": session_code,
+        "count": len(dockets),
+        "dockets": list(dockets.values()),
+    }
+
+
+@mcp.tool()
+def list_floor_calendars(chamber: Literal["H", "S"], session_code: int) -> dict[str, Any]:
+    """A chamber's floor calendars for a session, one per sitting.
+
+    A floor calendar is the day's order of business: the bills up for a
+    reading or a vote. Pass a ``calendar_id`` to get_floor_calendar for the
+    bills on it. Several calendars can share a date.
+    """
+    calendars = _call(_get_service().client.get_calendars, chamber, session_code)
+
+    return {
+        "chamber": chamber,
+        "session_code": session_code,
+        "count": len(calendars),
+        "calendars": [
+            drop_empty(
+                {
+                    "calendar_id": calendar.CalendarID,
+                    "reference": calendar.ReferenceNumber,
+                    "date": iso(calendar.CalendarDate),
+                    "description": calendar.Description,
+                }
+            )
+            for calendar in calendars
+        ],
+    }
+
+
+@mcp.tool(structured_output=False)
+def get_floor_calendar(calendar_id: int) -> dict[str, Any]:
+    """One floor calendar: the bills up for action, by section, with the votes taken.
+
+    ``calendar_id`` comes from list_floor_calendars. Each bill carries its
+    calendar section (e.g. "Senate Bills on Third Reading") and the actions
+    recorded against it, with a ``vote_id`` where a vote was taken; pass that
+    with the bill number and session code to get_roll_call.
+    """
+    calendar = _call(_get_service().client.get_calendar, calendar_id)
+
+    if calendar is None:
+        raise LookupError(f"No floor calendar has CalendarID {calendar_id}.")
+
+    bills = []
+    for category in calendar.CalendarCategories:
+        for agenda in category.Agendas:
+            if not agenda.LegislationNumber:
+                continue
+
+            actions = [
+                drop_empty(
+                    {
+                        "description": strip_html(item.Description) if item.Description else None,
+                        "vote_id": item.VoteID,
+                    }
+                )
+                for item in agenda.AgendaItems
+            ]
+            bills.append(
+                drop_empty(
+                    {
+                        "bill_number": agenda.LegislationNumber,
+                        "description": agenda.LegislationDescription,
+                        "section": category.Description,
+                        "actions": [action for action in actions if action],
+                    }
+                )
+            )
+
+    payload = drop_empty(
+        {
+            "calendar_id": calendar.CalendarID,
+            "reference": calendar.ReferenceNumber,
+            "date": iso(calendar.CalendarDate),
+            "chamber": calendar.ChamberCode,
+            "session_code": int(calendar.SessionCode) if calendar.SessionCode else None,
+        }
+    )
+    payload["count"] = len(bills)
+    payload["bills"] = bills
+    return payload
+
+
+# ----------------------------------------------------------------------------
+# Diagnostics
+# ----------------------------------------------------------------------------
 
 
 @mcp.tool()
@@ -335,7 +948,7 @@ def check_api_key() -> dict[str, Any]:
     it asks the PartnerAuthentication service whether the key is registered
     and active.
     """
-    partner = _call(_get_client().check_api_key)
+    partner = _call(_get_service().client.check_api_key)
 
     if partner is None:
         return {
@@ -346,7 +959,7 @@ def check_api_key() -> dict[str, Any]:
             ),
         }
 
-    return _drop_empty(
+    return drop_empty(
         {
             "valid": partner.IsActive,
             "organization": partner.OrganizationName,
@@ -361,12 +974,28 @@ def main() -> None:
     mcp.run()
 
 
-def _get_client() -> LISClient:
-    """A fresh client per call; the HTTP session underneath is shared module state.
+# ----------------------------------------------------------------------------
+# Service access and error handling
+# ----------------------------------------------------------------------------
+
+
+def _get_service() -> LISService:
+    """The process-wide service, built on the first tool call.
 
     Never instantiated at import time: MCP hosts launch servers at app boot,
-    and a missing key must fail the tool call, not the process.
+    and a missing key must fail the tool call, not the process. Once built,
+    the instance persists so its caches survive across calls.
     """
+    global _service
+
+    if _service is None:
+        _service = LISService(_get_client())
+
+    return _service
+
+
+def _get_client() -> LISClient:
+    """Build the transport client, rewrapping a missing key into a clear message."""
     try:
         return LISClient()
     except LISClientError as exc:
@@ -377,216 +1006,26 @@ def _get_client() -> LISClient:
 
 
 def _call(fn: Callable[..., Any], /, *args: Any, **kwargs: Any) -> Any:
-    """Invoke a client method, rewrapping LISClientError so messages stay readable."""
+    """Invoke a client method, rewrapping LISClientError so messages stay readable.
+
+    The service's own resolution errors (BillNotFoundError,
+    CommitteeNotFoundError, and friends) pass through untouched: their
+    messages are already written for the caller.
+    """
     try:
         return fn(*args, **kwargs)
     except LISClientError as exc:
         raise RuntimeError(f"LIS API error: {exc}") from exc
 
 
-def _compact_session(session: Session) -> dict[str, Any]:
-    return {
-        "session_code": int(session.SessionCode),
-        "session_id": session.SessionID,
-        "display_name": session.DisplayName,
-        "year": session.SessionYear,
-        "type": session.SessionType,
-        "is_active": session.IsActive,
-        "is_default": session.IsDefault,
-    }
+def _roster_member(service: LISService, member_id: int, session_code: int) -> Member:
+    """The roster row for a member, or a readable error naming the session."""
+    member = _call(service.members_by_id, session_code).get(member_id)
 
-
-def _session_bills(session_code: int) -> list[LegislationSummaryItem]:
-    """Bill list for a session, cached for a short TTL."""
-    now = time.monotonic()
-    cached = _bill_list_cache.get(session_code)
-    if cached is not None and now - cached[0] < _BILL_LIST_TTL_SECONDS:
-        return cached[1]
-
-    bills = _call(_get_client().get_session_bills, session_code=session_code)
-    _bill_list_cache[session_code] = (now, bills)
-    return bills
-
-
-def _compact_bill_row(item: LegislationSummaryItem) -> dict[str, Any]:
-    chief = next(
-        (p.MemberDisplayName for p in item.Patrons if p.PatronTypeID == 1),
-        None,
-    )
-
-    return _drop_empty(
-        {
-            "legislation_id": item.LegislationID,
-            "bill_number": item.LegislationNumber,
-            "description": item.Description,
-            "chamber": item.ChamberCode,
-            "type": item.LegislationTypeCode,
-            "status": item.LegislationStatus,
-            "chief_patron": chief,
-        }
-    )
-
-
-def _resolve_bill(bill_number: str, session_code: int) -> LegislationSummaryItem:
-    """Resolve a human bill number to its session bill record (and LegislationID)."""
-    number = _normalize_bill_number(bill_number)
-
-    for item in _session_bills(session_code):
-        if item.LegislationNumber.upper() == number:
-            return item
-
-    raise ValueError(
-        f"Bill {number} not found in session {session_code}. Check the bill number "
-        "and session code (use list_sessions; 20261 = 2026 Regular Session)."
-    )
-
-
-def _normalize_bill_number(bill_number: str) -> str:
-    """Uppercase and unpad: 'hb0001' -> 'HB1' (padded numbers return nothing from LIS)."""
-    candidate = bill_number.strip().upper().replace(" ", "")
-
-    match = _BILL_NUMBER_RE.fullmatch(candidate)
-    if match is None:
-        raise ValueError(
-            f"{bill_number!r} does not look like a bill number (expected a chamber "
-            "prefix plus digits, e.g. HB1, SB234, HJ5)."
+    if member is None:
+        raise LookupError(
+            f"MemberID {member_id} is not on the session {session_code} roster. "
+            "Use list_members to search the roster by name."
         )
 
-    prefix, digits = match.groups()
-    return f"{prefix}{int(digits)}"
-
-
-def _status_display(bill: Legislation, item: LegislationSummaryItem) -> str | None:
-    """Best available status label; the detail endpoint's status text is often null."""
-    if bill.LegislationStatus:
-        return bill.LegislationStatus
-
-    if bill.LegislationStatusID is not None:
-        status = _statuses_by_id().get(bill.LegislationStatusID)
-        if status is not None:
-            return status.DisplayName
-
-    return item.LegislationStatus
-
-
-def _condense_patrons(patrons: list[Patron]) -> dict[str, list[str]]:
-    """Group patron names by role, e.g. {"Chief Patron": [...], "Co-Patron": [...]}."""
-    grouped: dict[str, list[str]] = {}
-
-    for patron in patrons:
-        name = patron.MemberDisplayName or patron.PatronDisplayName or patron.MemberNumber
-        grouped.setdefault(patron.Name, []).append(name)
-
-    return grouped
-
-
-def _iso(value: datetime | None) -> str | None:
-    return value.isoformat() if value is not None else None
-
-
-def _drop_empty(payload: dict[str, Any]) -> dict[str, Any]:
-    """Remove None and empty-container values; False and 0 are kept."""
-    return {k: v for k, v in payload.items() if v is not None and v != [] and v != {}}
-
-
-def _pick_text_version(
-    texts: list[LegislationTextItem],
-    document_code: str | None,
-) -> LegislationTextItem:
-    if document_code is None:
-        # LegislationTextID is a monotonically increasing surrogate key, so the
-        # highest ID is the most recent version (DraftDate is not always set).
-        return max(texts, key=lambda t: t.LegislationTextID)
-
-    wanted = document_code.strip().upper()
-    for text in texts:
-        if (text.DocumentCode or "").upper() == wanted:
-            return text
-
-    available = ", ".join(t.DocumentCode or "?" for t in texts)
-    raise ValueError(f"No text version {wanted!r} for this bill; available versions: {available}.")
-
-
-def _strip_html(markup: str) -> str:
-    """Flatten HTML to readable plain text using only the stdlib parser."""
-    extractor = _TextExtractor()
-    extractor.feed(markup)
-    extractor.close()
-
-    text = extractor.text()
-    text = re.sub(r"[ \t]+", " ", text)
-    text = re.sub(r" ?\n ?", "\n", text)
-    text = re.sub(r"\n{3,}", "\n\n", text)
-    return text.strip()
-
-
-class _TextExtractor(HTMLParser):
-    """Collects text content, dropping tags and <script>/<style> bodies."""
-
-    _SKIP_CONTENT = {"script", "style"}
-    _BLOCK = {"p", "div", "br", "li", "tr", "table", "section", "h1", "h2", "h3", "h4"}
-
-    def __init__(self) -> None:
-        super().__init__()
-        self._chunks: list[str] = []
-        self._skip_depth = 0
-
-    def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
-        if tag in self._SKIP_CONTENT:
-            self._skip_depth += 1
-        elif tag in self._BLOCK:
-            self._chunks.append("\n")
-
-    def handle_endtag(self, tag: str) -> None:
-        if tag in self._SKIP_CONTENT and self._skip_depth:
-            self._skip_depth -= 1
-        elif tag in self._BLOCK:
-            self._chunks.append("\n")
-
-    def handle_data(self, data: str) -> None:
-        if not self._skip_depth:
-            self._chunks.append(data)
-
-    def text(self) -> str:
-        return "".join(self._chunks)
-
-
-def _event_types_by_code() -> dict[str, LegislationEventType]:
-    """The 3,912-row event type reference, fetched once per process.
-
-    Reference rows come back with LegislationEventTypeID null, so EventCode is
-    the join key onto events.
-    """
-    global _event_type_index
-
-    if _event_type_index is None:
-        types = _call(_get_client().get_event_types)
-        _event_type_index = {t.EventCode: t for t in types if t.EventCode}
-
-    return _event_type_index
-
-
-def _statuses_by_name() -> dict[str, LegislationStatus]:
-    """Status reference keyed by internal Name.
-
-    Events carry the status name and a null LegislationStatusID, so the name
-    is the per-event join key into the 52-status vocabulary.
-    """
-    return _status_indexes()[0]
-
-
-def _statuses_by_id() -> dict[int, LegislationStatus]:
-    return _status_indexes()[1]
-
-
-def _status_indexes() -> tuple[dict[str, LegislationStatus], dict[int, LegislationStatus]]:
-    global _status_index
-
-    if _status_index is None:
-        statuses = _call(_get_client().get_legislation_statuses)
-        _status_index = (
-            {s.Name: s for s in statuses},
-            {s.LegislationStatusID: s for s in statuses},
-        )
-
-    return _status_index
+    return member

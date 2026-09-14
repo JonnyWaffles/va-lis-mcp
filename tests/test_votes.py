@@ -5,6 +5,7 @@ from __future__ import annotations
 from datetime import datetime
 
 import pytest
+from mcp.server.mcpserver.exceptions import ToolError
 
 from tests.factories import HB1, ROSTER, make_event, make_member_vote, make_vote
 from tests.fakes import call_names
@@ -214,7 +215,7 @@ def test_get_member_votes_on_one_bill(fake_client):
 def test_get_member_votes_unknown_member_points_at_the_roster(fake_client):
     fake_client.members = ROSTER
 
-    with pytest.raises(LookupError) as excinfo:
+    with pytest.raises(ToolError) as excinfo:
         server.get_member_votes(999, 20261)
 
     message = str(excinfo.value)

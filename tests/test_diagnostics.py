@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import pytest
+from mcp.server.mcpserver.exceptions import ToolError
 from va_lis_client import LISClientError
 from va_lis_client.models import Partner
 
@@ -41,7 +42,7 @@ def test_check_api_key_unregistered(fake_client):
 def test_missing_api_key_error(monkeypatch):
     monkeypatch.delenv("LIS_API_KEY", raising=False)
 
-    with pytest.raises(RuntimeError) as excinfo:
+    with pytest.raises(ToolError) as excinfo:
         server.check_api_key()
 
     message = str(excinfo.value)
@@ -55,5 +56,5 @@ def test_lis_client_error_is_wrapped(fake_client, monkeypatch):
 
     monkeypatch.setattr(fake_client, "get_session_bills", boom)
 
-    with pytest.raises(RuntimeError, match="LIS API error"):
+    with pytest.raises(ToolError, match="LIS API error"):
         server.list_bills(20261)

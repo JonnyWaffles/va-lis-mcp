@@ -5,7 +5,7 @@ from __future__ import annotations
 from datetime import date, datetime
 
 import pytest
-from va_lis_client import CommitteeNotFoundError
+from mcp.server.mcpserver.exceptions import ToolError
 
 from tests.factories import (
     COMMITTEES,
@@ -86,10 +86,10 @@ def test_list_meetings_filters_by_type_and_paginates(fake_client):
 
 
 def test_list_meetings_rejects_bad_dates(fake_client):
-    with pytest.raises(ValueError, match="start_date"):
+    with pytest.raises(ToolError, match="start_date"):
         server.list_meetings("Feb 2", "2026-02-06")
 
-    with pytest.raises(ValueError, match="before"):
+    with pytest.raises(ToolError, match="before"):
         server.list_meetings("2026-02-06", "2026-02-02")
 
     assert fake_client.calls == []
@@ -132,7 +132,7 @@ def test_list_dockets_groups_bills_by_docket(fake_client):
 def test_list_dockets_rejects_a_house_committee(fake_client):
     fake_client.committees = COMMITTEES
 
-    with pytest.raises(CommitteeNotFoundError):
+    with pytest.raises(ToolError):
         server.list_dockets("H08", 20261)
 
 
@@ -169,5 +169,5 @@ def test_get_floor_calendar_flattens_bills_with_their_votes(fake_client):
 
 
 def test_get_floor_calendar_unknown_id(fake_client):
-    with pytest.raises(LookupError, match="12345"):
+    with pytest.raises(ToolError, match="12345"):
         server.get_floor_calendar(12345)

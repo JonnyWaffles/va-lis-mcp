@@ -5,7 +5,7 @@ from __future__ import annotations
 from datetime import datetime
 
 import pytest
-from va_lis_client import BillNotFoundError, TextVersionNotFoundError
+from mcp.server.mcpserver.exceptions import ToolError
 from va_lis_client.models import (
     Legislation,
     LegislationEvent,
@@ -89,7 +89,7 @@ def test_session_bill_list_is_cached(fake_client):
 def test_get_bill_not_found_names_bill_and_session(fake_client):
     fake_client.bills = [HB1]
 
-    with pytest.raises(BillNotFoundError) as excinfo:
+    with pytest.raises(ToolError) as excinfo:
         server.get_bill("HB999", 20261)
 
     message = str(excinfo.value)
@@ -240,7 +240,7 @@ def test_get_bill_text_unknown_version_lists_available(fake_client):
         make_text_item(266240, "HB1ER", "Enrolled"),
     ]
 
-    with pytest.raises(TextVersionNotFoundError) as excinfo:
+    with pytest.raises(ToolError) as excinfo:
         server.get_bill_text("HB1", 20261, document_code="HB1S1")
 
     message = str(excinfo.value)

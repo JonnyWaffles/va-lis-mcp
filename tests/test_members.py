@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import pytest
+from mcp.server.mcpserver.exceptions import ToolError
 from va_lis_client.models import CHIEF_PATRON
 
 from tests.factories import COMMITTEES, ROSTER, SEATS, make_member_bill
@@ -65,7 +66,7 @@ def test_get_member_adds_contact_fields(fake_client):
 def test_get_member_unknown_id(fake_client):
     fake_client.members = ROSTER
 
-    with pytest.raises(LookupError, match="999"):
+    with pytest.raises(ToolError, match="999"):
         server.get_member(999, 20261)
 
 

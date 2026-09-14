@@ -26,9 +26,11 @@ from collections.abc import Callable
 from typing import Any, Literal
 
 from mcp.server import MCPServer
+from mcp.server.mcpserver.exceptions import ToolError
 from va_lis_client import (
     LISClient,
     LISClientError,
+    LISError,
     LISService,
     normalize_bill_number,
     strip_html,
@@ -165,7 +167,7 @@ def get_current_session() -> dict[str, Any]:
     session = _call(_get_service().client.get_default_session)
 
     if session is None:
-        raise RuntimeError("LIS did not report a default session.")
+        raise ToolError("LIS did not report a default session.")
 
     payload = compact_session(session)
     payload["note"] = (
@@ -269,7 +271,7 @@ def get_bill_patrons(bill_number: str, session_code: int) -> dict[str, Any]:
     get_member_committees. get_bill lists the same names grouped by role,
     without ids.
     """
-    number = normalize_bill_number(bill_number)
+    number = _call(normalize_bill_number, bill_number)
     patrons = _call(_get_service().bill_patrons, number, session_code)
 
     return {
@@ -287,7 +289,7 @@ def get_bill_summaries(bill_number: str, session_code: int) -> dict[str, Any]:
     The entry with ``is_active`` true is the current summary. An empty list
     means LIS has published no summary for that bill and session.
     """
-    number = normalize_bill_number(bill_number)
+    number = _call(normalize_bill_number, bill_number)
     summaries = _call(
         _get_service().client.get_bill_summaries,
         legislation_number=number,
@@ -330,7 +332,7 @@ def get_bill_text(
     Amendment markup (additions and strikethrough deletions) is flattened
     to plain text.
     """
-    number = normalize_bill_number(bill_number)
+    number = _call(normalize_bill_number, bill_number)
     service = _get_service()
     texts = _call(service.bill_text_versions, number, session_code)
 
@@ -375,7 +377,7 @@ def get_bill_history(bill_number: str, session_code: int) -> dict[str, Any]:
     that acted; this is the only place LIS records which committee holds a
     bill. ``vote_id`` links an event to its vote: pass it to get_roll_call.
     """
-    number = normalize_bill_number(bill_number)
+    number = _call(normalize_bill_number, bill_number)
     service = _get_service()
     legislation_id = _call(service.resolve_bill_id, number, session_code)
     events = _call(service.client.get_bill_events, legislation_id)
@@ -427,7 +429,7 @@ def get_bill_votes(bill_number: str, session_code: int) -> dict[str, Any]:
     any one of them). Pass a ``vote_id`` to get_roll_call for the member by
     member record. Costs one request per vote.
     """
-    number = normalize_bill_number(bill_number)
+    number = _call(normalize_bill_number, bill_number)
     records = _call(_get_service().bill_votes, number, session_code)
 
     return {
@@ -453,7 +455,7 @@ def get_roll_call(
     and block votes are left out (get_bill_votes lists those too).
     ``vote_id`` narrows the result to one vote.
     """
-    number = normalize_bill_number(bill_number)
+    number = _call(normalize_bill_number, bill_number)
     entries = _call(_get_service().roll_call, number, session_code, vote_id=vote_id)
 
     roll_calls: dict[int, dict[str, Any]] = {}
@@ -507,7 +509,7 @@ def get_member_votes(
     member = _roster_member(service, member_id, session_code)
 
     if bill_number is not None:
-        number = normalize_bill_number(bill_number)
+        number = _call(normalize_bill_number, bill_number)
         votes = _call(service.member_votes_on, member_id, number, session_code)
     else:
         number = None
@@ -789,10 +791,14 @@ def list_meetings(
     listed with ``cancelled`` true. ``limit`` is capped at 200; page with
     ``offset``.
     """
-    start = parse_date(start_date, "start_date")
-    end = parse_date(end_date, "end_date")
+    try:
+        start = parse_date(start_date, "start_date")
+        end = parse_date(end_date, "end_date")
+    except ValueError as exc:
+        raise ToolError(str(exc)) from exc
+
     if end < start:
-        raise ValueError("end_date must not be before start_date.")
+        raise ToolError("end_date must not be before start_date.")
 
     service = _get_service()
     owner_id = None
@@ -893,7 +899,7 @@ def get_floor_calendar(calendar_id: int) -> dict[str, Any]:
     calendar = _call(_get_service().client.get_calendar, calendar_id)
 
     if calendar is None:
-        raise LookupError(f"No floor calendar has CalendarID {calendar_id}.")
+        raise ToolError(f"No floor calendar has CalendarID {calendar_id}.")
 
     bills = []
     for category in calendar.CalendarCategories:
@@ -999,23 +1005,29 @@ def _get_client() -> LISClient:
     try:
         return LISClient()
     except LISClientError as exc:
-        raise RuntimeError(
+        raise ToolError(
             f"LIS_API_KEY is not set. Register for a free key at {_REGISTRATION_URL} "
             "and set the LIS_API_KEY environment variable for this server."
         ) from exc
 
 
 def _call(fn: Callable[..., Any], /, *args: Any, **kwargs: Any) -> Any:
-    """Invoke a client method, rewrapping LISClientError so messages stay readable.
+    """Invoke a client or service call, converting its errors into ToolError.
 
-    The service's own resolution errors (BillNotFoundError,
-    CommitteeNotFoundError, and friends) pass through untouched: their
-    messages are already written for the caller.
+    Every error a tool raises has to be a ToolError to reach the caller. mcp
+    replaces anything else with "Error executing tool <name>" and sends no
+    detail (see UnexpectedToolError), so a message written for the caller is
+    lost unless it is raised as a ToolError. Chaining with ``from`` still puts
+    the original and its traceback in the server's log.
     """
     try:
         return fn(*args, **kwargs)
     except LISClientError as exc:
-        raise RuntimeError(f"LIS API error: {exc}") from exc
+        raise ToolError(f"LIS API error: {exc}") from exc
+    except LISError as exc:
+        # BillNotFoundError, CommitteeNotFoundError, InvalidBillNumberError and
+        # friends already read well; pass their text straight through.
+        raise ToolError(str(exc)) from exc
 
 
 def _roster_member(service: LISService, member_id: int, session_code: int) -> Member:
@@ -1023,7 +1035,7 @@ def _roster_member(service: LISService, member_id: int, session_code: int) -> Me
     member = _call(service.members_by_id, session_code).get(member_id)
 
     if member is None:
-        raise LookupError(
+        raise ToolError(
             f"MemberID {member_id} is not on the session {session_code} roster. "
             "Use list_members to search the roster by name."
         )

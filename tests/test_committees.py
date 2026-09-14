@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import pytest
-from va_lis_client import CommitteeNotFoundError
+from mcp.server.mcpserver.exceptions import ToolError
 from va_lis_client.models import Committee
 
 from tests.factories import COMMITTEES, ROSTER, SEATS
@@ -70,7 +70,7 @@ def test_get_committee_resolves_a_name_and_joins_the_roster(fake_client):
 def test_get_committee_ambiguous_name_names_both_matches(fake_client):
     fake_client.committees = COMMITTEES
 
-    with pytest.raises(CommitteeNotFoundError) as excinfo:
+    with pytest.raises(ToolError) as excinfo:
         server.get_committee("Courts of Justice", 20261)
 
     message = str(excinfo.value)

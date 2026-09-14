@@ -1,0 +1,36 @@
+name: Test
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  # Dependencies break on their schedule, not ours. GitHub disables a cron
+  # after 60 days with no repo activity, so a silent Monday means check here.
+  schedule:
+    - cron: "17 13 * * 1"
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        # Matches the Python classifiers in pyproject.toml
+        python-version: ["3.10", "3.11", "3.12"]
+        # highest is what a user installing today gets. lowest-direct is the
+        # floor of every range in pyproject.toml, so ">=0.3.0" stays a promise.
+        resolution: [highest, lowest-direct]
+    steps:
+      - uses: actions/checkout@v7
+      # setup-uv publishes no floating major tag — pin the full version
+      - uses: astral-sh/setup-uv@v10.0.0
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache-dependency-glob: pyproject.toml
+      - run: uv sync --extra dev --resolution ${{ matrix.resolution }}
+      # pyproject sets fix = true; --no-fix makes CI fail on fixable violations
+      - run: uv run ruff check --no-fix src tests
+      - run: uv run pytest -q

@@ -9,6 +9,13 @@ venv/
 .pytest_cache/
 .ruff_cache/
 
+# uv's lockfile. Deliberately not committed. This is a published library, so
+# every CI run resolves fresh from the pyproject ranges instead: that catches
+# upstream breakage early and proves the declared lower bounds still install.
+# Note that a committed lock would silently pin CI, because plain `uv sync`
+# prefers the versions already in uv.lock unless you pass --upgrade.
+uv.lock
+
 # IDE
 .idea/
 .vscode/

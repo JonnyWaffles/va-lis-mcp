@@ -19,14 +19,17 @@ classifiers = [
 ]
 dependencies = [
     "mcp>=2,<3",
-    "va-lis-client>=0.1.1,<0.2",
+    "va-lis-client>=0.3.0,<0.4",
 ]
 
 [project.optional-dependencies]
+# Floors are real claims: CI runs a --resolution lowest-direct job against
+# them. pytest-asyncio 1.x needs pytest >= 8.2, and asyncio_mode = "auto"
+# below needs pytest-asyncio >= 1.
 dev = [
-    "pytest",
-    "pytest-asyncio",
-    "ruff",
+    "pytest>=8.2",
+    "pytest-asyncio>=1",
+    "ruff>=0.14",
 ]
 
 [project.scripts]
@@ -47,6 +50,8 @@ where = ["src"]
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 asyncio_mode = "auto"
+# pytest-asyncio warns when this is unset and will change its default later.
+asyncio_default_fixture_loop_scope = "function"
 
 [tool.ruff]
 line-length = 100

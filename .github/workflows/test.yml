@@ -9,6 +9,8 @@ on:
   # after 60 days with no repo activity, so a silent Monday means check here.
   schedule:
     - cron: "17 13 * * 1"
+  # Called by publish.yml, so a release cannot ship an untested build.
+  workflow_call:
 
 permissions:
   contents: read

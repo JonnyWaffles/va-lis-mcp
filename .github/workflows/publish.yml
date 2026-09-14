@@ -8,7 +8,13 @@ permissions:
   contents: read
 
 jobs:
+  # The whole matrix, including the lowest-direct floor jobs. A release that
+  # cannot pass its own tests never reaches the build step.
+  test:
+    uses: ./.github/workflows/test.yml
+
   build:
+    needs: test
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7

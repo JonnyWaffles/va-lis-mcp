@@ -1,3 +1,6 @@
 """MCP server for the Virginia Legislative Information System (LIS) API."""
 
-__version__ = "0.1.0"
+from importlib.metadata import version
+
+# pyproject.toml holds the number. Reading it back keeps the two in step.
+__version__ = version("va-lis-mcp")

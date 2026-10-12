@@ -8,36 +8,55 @@ import pytest
 from mcp import Client
 from va_lis_client.models import LegislationSummaryItem, Member, Patron
 
+from tests.factories import make_search_row
 from va_lis_mcp import server
 
 EXPECTED_TOOLS = {
     # sessions
     "get_current_session",
     "list_sessions",
+    "get_session",
     # bills
     "list_bills",
+    "search_bills",
+    "list_most_viewed_bills",
+    "list_amended_bills",
+    "list_conference_bills",
     "get_bill",
     "get_bill_patrons",
     "get_bill_summaries",
     "get_bill_text",
+    "get_bill_versions",
     "get_bill_history",
     # votes
     "get_bill_votes",
+    "get_bill_vote_tallies",
+    "list_votes",
     "get_roll_call",
     "get_member_votes",
     # members
     "list_members",
     "get_member",
+    "get_member_office",
     "get_member_bills",
     "get_member_committees",
     # committees
     "list_committees",
     "get_committee",
+    "get_committee_staff",
     # meetings
     "list_meetings",
     "list_dockets",
     "list_floor_calendars",
     "get_floor_calendar",
+    # chamber records
+    "list_minutes_books",
+    "get_minutes_book",
+    "list_communications",
+    "get_communication",
+    # statistics
+    "get_session_statistics",
+    "get_committee_statistics",
     # diagnostics
     "check_api_key",
 }
@@ -162,3 +181,27 @@ async def test_enum_parameter_is_validated_by_the_schema(monkeypatch):
 
     assert result.is_error is True
     assert "chamber" in result.content[0].text
+
+
+async def test_search_bills_end_to_end(fake_client):
+    fake_client.search_results = [
+        make_search_row(98642, "HB19", "Firearms; purchase after assault", chapter="CHAP0527")
+    ]
+
+    async with Client(server.mcp) as client:
+        result = await client.call_tool(
+            "search_bills",
+            {"session_code": 20261, "keyword": "firearm", "search_in": "Bill Text"},
+        )
+        rejected = await client.call_tool(
+            "search_bills",
+            {"session_code": 20261, "keyword": "firearm", "search_in": "Title"},
+        )
+
+    assert result.is_error is False
+    assert result.structured_content is None  # text only, as the other large payloads
+    data = json.loads(result.content[0].text)
+    assert data["search_in"] == "Bill Text"
+    assert data["bills"][0]["chapter"] == "CHAP0527"
+    assert rejected.is_error is True
+    assert "search_in" in rejected.content[0].text

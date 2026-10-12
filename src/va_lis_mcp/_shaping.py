@@ -18,20 +18,34 @@ from va_lis_client import (
     BillVote,
     CommitteeSeat,
     MemberVote,
+    MinutesRecord,
     RollCallEntry,
     strip_html,
 )
 from va_lis_client.models import (
     CHIEF_PATRON,
+    AmendedLegislation,
+    BillVersion,
+    ChamberStatistic,
     Committee,
+    CommitteeStatistic,
+    CommunicationCategory,
+    CommunicationListItem,
+    ConferenceLegislation,
+    Contact,
     DocketDetail,
     DocketItem,
+    LegislationSearchResult,
     LegislationSummaryItem,
     Member,
     MemberLegislation,
+    MinutesBookListItem,
     Patron,
+    Personnel,
     Schedule,
     Session,
+    SessionEvent,
+    ShallowVote,
     Vote,
 )
 
@@ -40,6 +54,32 @@ MAX_LIST_LIMIT = 200
 # A ballot's ResponseCode, and the label the tools report it as. "X" is
 # absent from LIS tally strings, so the member groups never sum to the tally.
 RESPONSE_LABELS = {"Y": "yea", "N": "nay", "A": "abstain", "X": "not_voting"}
+
+# StaffRoleTypeID behind each staff role name (verified live 2026-10-12). A
+# committee's personnel rows carry 1 and 2; the other five name chamber
+# officers.
+STAFF_ROLES = {
+    1: "Committee Clerk",
+    2: "Committee Staff",
+    3: "Clerk of the Senate",
+    4: "Clerk of the House of Delegates",
+    5: "President of the Senate",
+    6: "Senate Majority Leader",
+    7: "President Pro Tempore",
+}
+
+# The committee statistics name each count twice, once per originating
+# chamber of the bill. These are the column stems behind the H and S prefixes.
+_COMMITTEE_COUNTS = {
+    "referred": "Referred",
+    "reported": "Reported",
+    "failed": "Failed",
+    "incorporated": "Incorporated",
+    "in_committee": "InCommittee",
+    "in_subcommittee": "InSubCommittee",
+    "continued": "Continued",
+    "continued_from": "ContinuedFrom",
+}
 
 
 # ----------------------------------------------------------------------------
@@ -59,6 +99,16 @@ def compact_session(session: Session) -> dict[str, Any]:
     }
 
 
+def compact_session_event(event: SessionEvent) -> dict[str, Any]:
+    return drop_empty(
+        {
+            "name": event.DisplayName,
+            "date": iso(event.ActualDate),
+            "projected_date": iso(event.ProjectedDate),
+        }
+    )
+
+
 def compact_bill_row(item: LegislationSummaryItem) -> dict[str, Any]:
     chief = next(
         (p.MemberDisplayName for p in item.Patrons if p.PatronTypeID == CHIEF_PATRON),
@@ -74,6 +124,117 @@ def compact_bill_row(item: LegislationSummaryItem) -> dict[str, Any]:
             "type": item.LegislationTypeCode,
             "status": item.LegislationStatus,
             "chief_patron": chief,
+        }
+    )
+
+
+def one_row_per_bill(rows: list[LegislationSearchResult]) -> list[LegislationSearchResult]:
+    """Collapse search rows to one per bill, keeping the furthest-along summary.
+
+    LIS sends a search row per summary version and repeats some rows outright.
+    The rank picks the winner, not the arrival order, and each bill keeps the
+    place it first appeared in.
+    """
+    best: dict[int, LegislationSearchResult] = {}
+
+    for row in rows:
+        current = best.get(row.LegislationID)
+        if current is None or row.summary_rank > current.summary_rank:
+            best[row.LegislationID] = row
+
+    return list(best.values())
+
+
+def first_row_per_bill(rows: list[Any]) -> list[Any]:
+    """Drop the repeats LIS sends for a bill, keeping the first row and the order."""
+    unique: dict[int, Any] = {}
+
+    for row in rows:
+        unique.setdefault(row.LegislationID, row)
+
+    return list(unique.values())
+
+
+def compact_search_row(
+    row: LegislationSearchResult,
+    include_summary: bool = False,
+) -> dict[str, Any]:
+    payload = {
+        "legislation_id": row.LegislationID,
+        "bill_number": row.LegislationNumber,
+        "description": row.Description,
+        "chamber": row.ChamberCode,
+        "type": row.LegislationTypeCode,
+        "status": row.LegislationStatus,
+        "chapter": row.ChapterNumber,
+        # A subcommittee row names itself and its parent; report the parent
+        # as the committee so the field reads the same on both kinds of row.
+        "committee": row.ParentCommitteeName or row.CommitteeName,
+        "subcommittee": row.CommitteeName if row.ParentCommitteeName else None,
+        "committee_number": row.CommitteeNumber,
+        "chief_patron": chief_patron(row.Patrons),
+    }
+
+    if include_summary:
+        payload["summary_version"] = row.SummaryVersion
+        payload["summary"] = strip_html(row.LegislationSummary) if row.LegislationSummary else None
+
+    return drop_empty(payload)
+
+
+def compact_bill_version(version: BillVersion) -> dict[str, Any]:
+    return drop_empty(
+        {
+            "document_code": version.DocumentCode,
+            "version": version.Version,
+            # The specific name ("Education Substitute"), when it says more
+            # than the version type ("Substitute").
+            "description": version.Description if version.Description != version.Version else None,
+            "date": iso(version.DraftDate),
+            "chamber": version.ChamberCode,
+            "sponsor": version.Sponsor,
+            "disposition": version.TextDisposition,
+            "pdf": next(iter(file_urls(version.PdfFile)), None),
+            "html": next(iter(file_urls(version.HtmlFile)), None),
+            "impact_statements": file_urls(version.ImpactFile),
+        }
+    )
+
+
+def compact_amended_bill(row: AmendedLegislation) -> dict[str, Any]:
+    return drop_empty(
+        {
+            "legislation_id": row.LegislationID,
+            "bill_number": row.LegislationNumber,
+            "description": row.Description,
+            "chamber": row.ChamberCode,
+            "status": row.LegislationStatus,
+            "chief_patron": chief_patron(row.Patrons),
+            "amendments": [
+                drop_empty(
+                    {
+                        "document_code": amendment.DocumentCode,
+                        "chamber": amendment.ChamberCode,
+                        "description": amendment.Description,
+                        "disposition": amendment.TextDisposition,
+                        "date": iso(amendment.VersionDate),
+                    }
+                )
+                for amendment in row.Amendments
+            ],
+        }
+    )
+
+
+def compact_conference_bill(row: ConferenceLegislation) -> dict[str, Any]:
+    return drop_empty(
+        {
+            "legislation_id": row.LegislationID,
+            "bill_number": row.LegislationNumber,
+            "description": row.Description,
+            "chamber": row.ChamberCode,
+            "type": row.LegislationTypeCode,
+            "status": row.LegislationStatus,
         }
     )
 
@@ -122,6 +283,36 @@ def compact_bill_vote(record: BillVote) -> dict[str, Any]:
             "members_recorded": len(vote.vote_members),
         }
     )
+
+
+def compact_shallow_vote(vote: ShallowVote, include_bill: bool = True) -> dict[str, Any]:
+    """A vote without its members. ``include_bill`` is off when the caller named the bill."""
+    payload = {
+        "vote_id": vote.VoteID,
+        "date": iso(vote.VoteDate),
+        "chamber": vote.ChamberCode,
+        "type": vote.VoteType,
+        "committee": vote.CommitteeName,
+    }
+
+    if include_bill:
+        # A block vote writes "BLOCK" where the bill number belongs.
+        payload["bill_number"] = None if vote.is_block else vote.LegislationNumber
+
+        # "Attendance" marks a quorum call, which is a vote about no bill.
+        if vote.ClassificationName != "Legislation":
+            payload["classification"] = vote.ClassificationName
+
+    payload.update(
+        {
+            "description": vote.Description,
+            "tally": vote.VoteTally,
+            "is_block": vote.is_block or None,
+            "is_voice": vote.IsVoice or None,
+            "referred_to": vote.ReferToCommitteeName,
+        }
+    )
+    return drop_empty(payload)
 
 
 def roll_call_header(vote: Vote) -> dict[str, Any]:
@@ -307,9 +498,169 @@ def compact_docket_item(item: DocketItem) -> dict[str, Any]:
     )
 
 
+def compact_minutes_book(book: MinutesBookListItem) -> dict[str, Any]:
+    """The book-level fields, shared by the list rows and the detail header."""
+    calendar = book.MinutesCalendars[0] if book.MinutesCalendars else None
+    html = book.html_file
+
+    return drop_empty(
+        {
+            "minutes_book_id": book.MinutesBookID,
+            "date": iso(book.MinutesDate),
+            "chamber": book.ChamberCode,
+            "committee_id": book.CommitteeID,
+            "committee": book.CommitteeName,
+            # LIS's own IsCommittee flag is false on every row; a floor book
+            # is the one with no committee.
+            "is_floor": book.is_floor or None,
+            "status": book.MinutesStatus,
+            "calendar_id": calendar.CalendarID if calendar else None,
+            "html": html.FileURL if html else None,
+        }
+    )
+
+
+def compact_minutes_record(record: MinutesRecord, section: str | None) -> dict[str, Any]:
+    entry = record.entry
+    notes = [strip_html(s.summary) for s in entry.MinutesSummaries if s.summary]
+
+    return drop_empty(
+        {
+            "bill_number": record.bill_number,
+            "description": entry.LegislationDescription,
+            "section": section,
+            # A procedural entry names itself ("Recess") where a bill would be.
+            "entry": entry.EntryText,
+            "action": record.description,
+            "tally": record.tally,
+            "vote_id": record.vote_id,
+            "is_block": record.is_block or None,
+            "is_voice": record.is_voice or None,
+            "notes": [note for note in notes if note],
+        }
+    )
+
+
+def compact_communication_row(row: CommunicationListItem) -> dict[str, Any]:
+    """The message-level fields, shared by the list rows and the detail header."""
+    html = row.html_file
+
+    return drop_empty(
+        {
+            "communication_id": row.CommunicationID,
+            "date": iso(row.CommunicationDate),
+            "chamber": row.ChamberCode,
+            "reference": row.ReferenceNumber,
+            "number": row.CommunicationNumber,
+            "html": html.FileURL if html else None,
+        }
+    )
+
+
+def compact_communication_category(category: CommunicationCategory) -> dict[str, Any]:
+    """One sentence of a communication, with the bills it applies to."""
+    return {
+        # label prefers the description field that is correct when the two
+        # LIS sends disagree.
+        "statement": category.label,
+        "bills": [
+            drop_empty(
+                {
+                    "bill_number": bill.LegislationNumber,
+                    "description": bill.LegislationDescription,
+                    "document_code": bill.DocumentCode,
+                    "chief_patron": chief_patron(bill.Patrons),
+                }
+            )
+            for bill in category.bills
+        ],
+    }
+
+
+def compact_staff(person: Personnel) -> dict[str, Any]:
+    return drop_empty(
+        {
+            "name": person.FullName,
+            "role": STAFF_ROLES.get(person.StaffRoleTypeID or 0),
+            "since": iso(person.EffectiveBeginDate),
+        }
+    )
+
+
+def compact_office(office: Contact) -> dict[str, Any]:
+    lines = [office.Address1, office.Address2, office.Address3]
+
+    return drop_empty(
+        {
+            "address": [line for line in lines if line],
+            "city": office.City or None,
+            "state": office.StateCode or None,
+            "zip": office.ZipCode or None,
+            "phone": office.PhoneNumber or None,
+            "email": office.EmailAddress or None,
+        }
+    )
+
+
+def compact_chamber_statistic(row: ChamberStatistic) -> dict[str, Any]:
+    return drop_empty(
+        {
+            "chamber": row.ChamberCode,
+            "type": row.LegislationTypeCode,
+            "introduced": row.Introduced,
+            "continued_from_last_session": row.ContinuedFromLastSession,
+            "total": row.total,
+            "passed_house": row.PassedHouse,
+            "passed_senate": row.PassedSenate,
+            "passed": row.Passed,
+            "approved": row.Approved,
+            "vetoed": row.Veto,
+            "awaiting_governor": row.AwaitingGovAction,
+            "failed": row.Failed,
+            "incorporated": row.Incorporated,
+            "pending": row.Pending,
+            "continued_to_next_session": row.ContinuedToNextSession,
+        }
+    )
+
+
+def compact_committee_statistic(row: CommitteeStatistic) -> dict[str, Any]:
+    """One committee's referral counts, split by the bill's chamber of origin."""
+    return {
+        "committee_id": row.CommitteeID,
+        "number": row.CommitteeNumber,
+        "name": row.CommitteeName,
+        "house_bills": _committee_counts(row, "H"),
+        "senate_bills": _committee_counts(row, "S"),
+    }
+
+
+def _committee_counts(row: CommitteeStatistic, prefix: str) -> dict[str, int]:
+    counts = {key: getattr(row, prefix + stem) for key, stem in _COMMITTEE_COUNTS.items()}
+
+    return drop_empty(counts)
+
+
 # ----------------------------------------------------------------------------
 # Small helpers
 # ----------------------------------------------------------------------------
+
+
+def chief_patron(patrons: list[Patron]) -> str | None:
+    """The chief patron's name, or None when the list names none."""
+    return next(
+        (
+            patron.MemberDisplayName or patron.PatronDisplayName
+            for patron in patrons
+            if patron.PatronTypeID == CHIEF_PATRON
+        ),
+        None,
+    )
+
+
+def file_urls(files: list[Any] | None) -> list[str]:
+    """The addresses of a version's files. LIS sends null where it has none."""
+    return [f.FileURL for f in files or [] if f.FileURL]
 
 
 def matches(needle: str, *fields: str | None) -> bool:

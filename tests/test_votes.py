@@ -2,12 +2,19 @@
 
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import date, datetime
 
 import pytest
 from mcp.server.mcpserver.exceptions import ToolError
 
-from tests.factories import HB1, ROSTER, make_event, make_member_vote, make_vote
+from tests.factories import (
+    HB1,
+    ROSTER,
+    make_event,
+    make_member_vote,
+    make_shallow_vote,
+    make_vote,
+)
 from tests.fakes import call_names
 from va_lis_mcp import server
 
@@ -222,3 +229,132 @@ def test_get_member_votes_unknown_member_points_at_the_roster(fake_client):
     assert "999" in message
     assert "list_members" in message
     assert "get_member_votes" not in call_names(fake_client)
+
+
+def test_get_bill_vote_tallies_merges_both_chambers_without_the_rosters(fake_client):
+    fake_client.bills = [HB1]
+    fake_client.shallow_votes = {
+        "H": [
+            make_shallow_vote(
+                294006,
+                "HB1",
+                datetime(2026, 2, 3, 7, 35),
+                description="Read third time and passed House (64-Y 34-N 0-A)",
+            ),
+            make_shallow_vote(
+                291609,
+                "HB1",
+                datetime(2026, 1, 20, 12, 30),
+                vote_type="Committee",
+                committee="Labor and Commerce",
+                description="Reported from Labor and Commerce (15-Y 7-N)",
+                tally="(15-Y 7-N)",
+                referred_to="Appropriations",
+            ),
+        ],
+        # A block vote writes "BLOCK" where the bill number belongs.
+        "S": [
+            make_shallow_vote(
+                300173, "BLOCK", datetime(2026, 3, 4), chamber="S", tally="(40-Y 0-N)"
+            )
+        ],
+    }
+
+    result = server.get_bill_vote_tallies("hb0001", 20261)
+
+    assert result["bill_number"] == "HB1"
+    assert result["count"] == 3
+    committee, floor, block = result["votes"]  # oldest first, both chambers
+    assert committee == {
+        "vote_id": 291609,
+        "date": "2026-01-20T12:30:00",
+        "chamber": "H",
+        "type": "Committee",
+        "committee": "Labor and Commerce",
+        "description": "Reported from Labor and Commerce (15-Y 7-N)",
+        "tally": "(15-Y 7-N)",
+        "referred_to": "Appropriations",
+    }
+    assert floor["vote_id"] == 294006
+    assert "is_block" not in floor
+    assert block["chamber"] == "S"
+    assert block["is_block"] is True
+    # One request per chamber, and none for a roll call.
+    names = call_names(fake_client)
+    assert names.count("get_shallow_votes") == 2
+    assert "get_vote" not in names
+    assert fake_client.calls[-1][1]["legislation_id"] == 98525
+
+
+def test_list_votes_reads_one_day_and_makes_the_end_date_inclusive(fake_client):
+    fake_client.shallow_votes = {
+        "H": [
+            make_shallow_vote(
+                291700,
+                "SB10",
+                datetime(2026, 1, 20, 14, 0),
+                description="Passed House (97-Y 0-N)",
+                tally="(97-Y 0-N)",
+            ),
+            make_shallow_vote(
+                291589,
+                None,
+                datetime(2026, 1, 20, 12, 0),
+                description="Attendance",
+                tally="quorum present",
+                classification="Attendance",
+            ),
+            make_shallow_vote(291650, "BLOCK", datetime(2026, 1, 20, 13, 0)),
+        ]
+    }
+
+    result = server.list_votes("H", 20261, "2026-01-20")
+
+    assert result["start_date"] == "2026-01-20"
+    assert result["end_date"] == "2026-01-20"
+    assert result["total_matching"] == 3
+    # LIS reads its end date as exclusive, so the tool sends the day after.
+    assert fake_client.calls == [
+        (
+            "get_shallow_votes",
+            {
+                "chamber_code": "H",
+                "session_code": 20261,
+                "legislation_id": None,
+                "start_date": date(2026, 1, 20),
+                "end_date": date(2026, 1, 21),
+            },
+        )
+    ]
+    attendance, block, floor = result["votes"]
+    assert attendance["classification"] == "Attendance"
+    assert "bill_number" not in attendance
+    assert block["is_block"] is True
+    assert "bill_number" not in block
+    # The chamber that voted, on a bill from the other chamber.
+    assert floor["chamber"] == "H"
+    assert floor["bill_number"] == "SB10"
+    assert "classification" not in floor
+
+
+def test_list_votes_takes_a_range_and_paginates(fake_client):
+    fake_client.shallow_votes = {
+        "S": [make_shallow_vote(n, f"SB{n}", datetime(2026, 2, n), chamber="S") for n in (3, 1, 2)]
+    }
+
+    result = server.list_votes("S", 20261, "2026-02-01", "2026-02-03", limit=1, offset=1)
+
+    assert fake_client.calls[-1][1]["end_date"] == date(2026, 2, 4)
+    assert result["end_date"] == "2026-02-03"
+    assert result["total_matching"] == 3
+    assert [v["bill_number"] for v in result["votes"]] == ["SB2"]
+
+
+def test_list_votes_rejects_bad_dates(fake_client):
+    with pytest.raises(ToolError, match="start_date"):
+        server.list_votes("H", 20261, "January 20")
+
+    with pytest.raises(ToolError, match="before"):
+        server.list_votes("H", 20261, "2026-01-20", "2026-01-19")
+
+    assert fake_client.calls == []

@@ -10,22 +10,33 @@ from __future__ import annotations
 from datetime import datetime
 
 from va_lis_client.models import (
+    AmendedLegislation,
+    BillVersion,
     CalendarDetail,
     CalendarItem,
     Committee,
     CommitteeMember,
+    Communication,
+    CommunicationListItem,
+    ConferenceLegislation,
+    Contact,
     DocketDetail,
     DocketListItem,
     LegislationEvent,
+    LegislationSearchResult,
     LegislationSummaryItem,
     LegislationTextDetail,
     LegislationTextItem,
     Member,
     MemberLegislation,
     MemberVoteResult,
+    MinutesBook,
+    MinutesBookListItem,
     Patron,
+    Personnel,
     Schedule,
     Session,
+    ShallowVote,
     Vote,
 )
 
@@ -425,6 +436,306 @@ def make_calendar_detail(calendar_id: int, reference: str, when: datetime) -> Ca
                 ],
             },
         ],
+    )
+
+
+def make_search_row(
+    legislation_id: int,
+    number: str,
+    description: str,
+    *,
+    chamber: str = "H",
+    status: str = "In Committee",
+    version: str = "SUMMARY AS INTRODUCED",
+    summary: str | None = None,
+    chapter: str | None = None,
+    committee: tuple[int, str, str] | None = None,
+    parent: str | None = None,
+) -> LegislationSearchResult:
+    committee_id, committee_number, committee_name = committee or (0, None, None)
+
+    return LegislationSearchResult(
+        LegislationID=legislation_id,
+        LegislationNumber=number,
+        Description=description,
+        ChamberCode=chamber,
+        LegislationTypeCode="B",
+        LegislationStatus=status,
+        SummaryVersion=version,
+        LegislationSummary=summary,
+        ChapterNumber=chapter,
+        # LIS sends 0, not null, when no committee holds the bill.
+        CommitteeID=committee_id,
+        CommitteeNumber=committee_number,
+        CommitteeName=committee_name,
+        ParentCommitteeName=parent,
+        Patrons=[make_patron("Jeion A. Ward")],
+        SessionCode="20261",
+    )
+
+
+def make_bill_version(
+    text_id: int,
+    document_code: str,
+    version: str,
+    *,
+    description: str | None = None,
+    chamber: str = "H",
+    sponsor: str = "House",
+    disposition: str | None = "Posted",
+    when: datetime | None = None,
+    files: bool = True,
+) -> BillVersion:
+    def urls(format_id: int, names: tuple[str, ...]) -> list[dict]:
+        return [
+            {
+                "LegislationTextID": text_id,
+                "TextFormatID": format_id,
+                "FileURL": f"https://files.test/{name}",
+            }
+            for name in names
+        ]
+
+    return BillVersion(
+        LegislationTextID=text_id,
+        LegislationID=98525,
+        LegislationNumber="HB1",
+        ChamberCode=chamber,
+        DraftDate=when,
+        DocumentCode=document_code,
+        Description=description or version,
+        Sponsor=sponsor,
+        Version=version,
+        TextDisposition=disposition,
+        PdfFile=urls(1, (f"{text_id}.PDF",)) if files else [],
+        HtmlFile=urls(2, (f"{text_id}.HTML",)) if files else [],
+        # LIS sends null, not an empty list, where a version has no file.
+        ImpactFile=urls(3, (f"{text_id}-fis.PDF",)) if files else None,
+    )
+
+
+def make_amended_bill(
+    legislation_id: int,
+    number: str,
+    description: str,
+    amendments: tuple[tuple[str, str, str, str], ...],
+    *,
+    chamber: str = "H",
+    version: str = "SUMMARY AS INTRODUCED",
+) -> AmendedLegislation:
+    """``amendments`` are (document code, chamber, description, disposition) rows."""
+    return AmendedLegislation(
+        LegislationID=legislation_id,
+        LegislationNumber=number,
+        Description=description,
+        ChamberCode=chamber,
+        LegislationStatus="Acts of Assembly Chapter",
+        SummaryVersion=version,
+        Amendments=[
+            {
+                "LegislationID": legislation_id,
+                "LegislationTextID": 264_000 + n,
+                "DocumentCode": code,
+                "ChamberCode": amending_chamber,
+                "Description": name,
+                "TextDisposition": disposition,
+                "VersionDate": datetime(2026, 2, 23, 9, 45),
+            }
+            for n, (code, amending_chamber, name, disposition) in enumerate(amendments)
+        ],
+        Patrons=[make_patron("Betsy B. Carr", member_id=67)],
+    )
+
+
+def make_conference_bill(
+    legislation_id: int,
+    number: str,
+    description: str,
+    status: str = "Acts of Assembly Chapter",
+) -> ConferenceLegislation:
+    return ConferenceLegislation(
+        LegislationID=legislation_id,
+        LegislationNumber=number,
+        Description=description,
+        ChamberCode=number[0],
+        LegislationTypeCode="B",
+        LegislationStatus=status,
+        SessionID=59,
+    )
+
+
+def make_shallow_vote(
+    vote_id: int,
+    bill: str | None,
+    when: datetime,
+    *,
+    chamber: str = "H",
+    vote_type: str = "Floor",
+    committee: str | None = None,
+    description: str | None = None,
+    tally: str | None = "(64-Y 34-N 0-A)",
+    is_voice: bool = False,
+    classification: str | None = "Legislation",
+    referred_to: str | None = None,
+) -> ShallowVote:
+    return ShallowVote(
+        VoteID=vote_id,
+        VoteDate=when,
+        ChamberCode=chamber,
+        VoteType=vote_type,
+        CommitteeName=committee,
+        LegislationNumber=bill,
+        Description=description,
+        VoteTally=tally,
+        IsVoice=is_voice,
+        # False even on a block vote, as LIS sends it.
+        IsBlock=False,
+        ClassificationName=classification,
+        ReferToCommitteeName=referred_to,
+    )
+
+
+def make_minutes_book_row(
+    book_id: int,
+    when: datetime,
+    *,
+    chamber: str = "S",
+    committee: tuple[int, str] | None = None,
+    status: str = "Closed",
+) -> MinutesBookListItem:
+    return MinutesBookListItem(**_minutes_book_fields(book_id, when, chamber, committee, status))
+
+
+def make_minutes_book(
+    book_id: int,
+    when: datetime,
+    categories: list[dict],
+    *,
+    chamber: str = "S",
+    committee: tuple[int, str] | None = None,
+    status: str = "Closed",
+) -> MinutesBook:
+    return MinutesBook(
+        **_minutes_book_fields(book_id, when, chamber, committee, status),
+        MinutesCategories=categories,
+    )
+
+
+def _minutes_book_fields(
+    book_id: int,
+    when: datetime,
+    chamber: str,
+    committee: tuple[int, str] | None,
+    status: str,
+) -> dict:
+    fields: dict = {
+        "MinutesBookID": book_id,
+        "MinutesDate": when,
+        "MinutesStatus": status,
+        "ChamberCode": chamber,
+        "SessionID": 59,
+        # Always false, as LIS sends it, on committee books too.
+        "IsCommittee": False,
+        "MinutesFiles": [
+            {
+                "MinutesBookID": book_id,
+                "TextFormatID": 2,
+                "FileURL": f"https://files.test/{book_id}.HTML",
+            },
+            {
+                "MinutesBookID": book_id,
+                "TextFormatID": 5,
+                "FileURL": f"https://files.test/{book_id}.JSON",
+            },
+        ],
+    }
+
+    # LIS omits the committee keys on a floor book rather than nulling them.
+    if committee:
+        fields["CommitteeID"], fields["CommitteeName"] = committee
+    else:
+        fields["MinutesCalendars"] = [{"MinutesBookID": book_id, "CalendarID": 21_000 + book_id}]
+
+    return fields
+
+
+def make_communication_row(
+    communication_id: int,
+    reference: str,
+    when: datetime,
+    chamber: str = "H",
+) -> CommunicationListItem:
+    return CommunicationListItem(
+        **_communication_fields(communication_id, reference, when, chamber)
+    )
+
+
+def make_communication(
+    communication_id: int,
+    reference: str,
+    when: datetime,
+    categories: list[dict],
+    *,
+    chamber: str = "H",
+    session_code: str = "20261",
+) -> Communication:
+    return Communication(
+        **_communication_fields(communication_id, reference, when, chamber),
+        SessionCode=session_code,
+        CommunicationCategories=categories,
+    )
+
+
+def _communication_fields(
+    communication_id: int,
+    reference: str,
+    when: datetime,
+    chamber: str,
+) -> dict:
+    return {
+        "CommunicationID": communication_id,
+        "CommunicationDate": when,
+        "CommunicationNumber": 1,
+        "ReferenceNumber": reference,
+        "ChamberCode": chamber,
+        "SessionID": 59,
+        "CommunicationFiles": [
+            {
+                "CommunicationID": communication_id,
+                "TextFormatID": 2,
+                "FileURL": f"https://files.test/{communication_id}.HTML",
+            }
+        ],
+    }
+
+
+def make_staff(
+    staff_id: int,
+    name: str,
+    role_id: int,
+    committee_id: int = 8,
+) -> Personnel:
+    return Personnel(
+        StaffID=staff_id,
+        AffiliationID=committee_id,
+        StaffRoleTypeID=role_id,
+        FullName=name,
+        EffectiveBeginDate=datetime(2024, 1, 10),
+    )
+
+
+def make_office(member_id: int, contact_type_id: int = 9) -> Contact:
+    return Contact(
+        ContactInformationID=373,
+        OwnerID=member_id,
+        ContactTypeID=contact_type_id,
+        ContactType="Mailing",
+        Address1="P.O. Box 1853",
+        City="Norfolk",
+        StateCode="VA",
+        ZipCode="23501",
+        PhoneNumber="(757) 204-5492",
+        EmailAddress="DelBAnthony@house.virginia.gov",
     )
 
 

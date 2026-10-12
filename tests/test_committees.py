@@ -6,7 +6,8 @@ import pytest
 from mcp.server.mcpserver.exceptions import ToolError
 from va_lis_client.models import Committee
 
-from tests.factories import COMMITTEES, ROSTER, SEATS
+from tests.factories import COMMITTEES, ROSTER, SEATS, make_staff
+from tests.fakes import call_names
 from va_lis_mcp import server
 
 
@@ -76,3 +77,34 @@ def test_get_committee_ambiguous_name_names_both_matches(fake_client):
     message = str(excinfo.value)
     assert "H08" in message
     assert "S13" in message
+
+
+def test_get_committee_staff_names_each_role(fake_client):
+    fake_client.committees = COMMITTEES
+    fake_client.personnel = {
+        8: [make_staff(2012, "Annie Johnson", 1), make_staff(2014, "Britt Olwine", 2)]
+    }
+
+    result = server.get_committee_staff("courts", chamber="H")
+
+    assert result["committee_id"] == 8
+    assert result["number"] == "H08"
+    assert result["count"] == 2
+    assert result["staff"] == [
+        {"name": "Annie Johnson", "role": "Committee Clerk", "since": "2024-01-10T00:00:00"},
+        {"name": "Britt Olwine", "role": "Committee Staff", "since": "2024-01-10T00:00:00"},
+    ]
+    # The committee id is the AffiliationID on a personnel row.
+    assert fake_client.calls[-1] == (
+        "get_personnel",
+        {"affiliation_id": 8, "staff_role_type_id": None},
+    )
+
+
+def test_get_committee_staff_unknown_committee(fake_client):
+    fake_client.committees = COMMITTEES
+
+    with pytest.raises(ToolError):
+        server.get_committee_staff("Finance")
+
+    assert "get_personnel" not in call_names(fake_client)

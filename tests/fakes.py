@@ -3,15 +3,26 @@
 from __future__ import annotations
 
 from va_lis_client.models import (
+    AmendedLegislation,
+    BillVersion,
     CalendarDetail,
     CalendarItem,
+    ChamberStatistic,
     Committee,
     CommitteeMember,
+    CommitteeStatistic,
+    Communication,
+    CommunicationListItem,
+    ConferenceLegislation,
+    Contact,
     DocketDetail,
     DocketListItem,
     Legislation,
+    LegislationCategory,
     LegislationEvent,
     LegislationEventType,
+    LegislationNumberEntry,
+    LegislationSearchResult,
     LegislationStatus,
     LegislationSummary,
     LegislationSummaryItem,
@@ -20,10 +31,14 @@ from va_lis_client.models import (
     Member,
     MemberLegislation,
     MemberVoteResult,
+    MinutesBook,
+    MinutesBookListItem,
     Partner,
     Patron,
+    Personnel,
     Schedule,
     Session,
+    ShallowVote,
     Vote,
 )
 
@@ -60,6 +75,27 @@ class FakeClient:
         self.calendar_details: dict[int, CalendarDetail] = {}
         self.dockets: dict[int, list[DocketListItem]] = {}
         self.docket_details: dict[int, DocketDetail] = {}
+        self.session_details: dict[int, Session] = {}
+        self.search_results: list[LegislationSearchResult] = []
+        self.most_viewed: list[LegislationSearchResult] = []
+        self.categories: list[LegislationCategory] = []
+        self.legislative_numbers: list[LegislationNumberEntry] = []
+        # Keyed by LegislationID.
+        self.bill_versions: dict[int, list[BillVersion]] = {}
+        self.amended: list[AmendedLegislation] = []
+        self.conference: list[ConferenceLegislation] = []
+        # Keyed by the chamber that voted.
+        self.shallow_votes: dict[str, list[ShallowVote]] = {}
+        self.minutes_books: list[MinutesBookListItem] = []
+        self.minutes_book_details: dict[int, MinutesBook] = {}
+        self.communications: list[CommunicationListItem] = []
+        self.communication_details: dict[int, Communication] = {}
+        # Keyed by CommitteeID, which LIS calls the AffiliationID.
+        self.personnel: dict[int, list[Personnel]] = {}
+        # Keyed by MemberID.
+        self.contacts: dict[int, list[Contact]] = {}
+        self.chamber_statistics: list[ChamberStatistic] = []
+        self.committee_statistics: dict[str, list[CommitteeStatistic]] = {}
 
     def _record(self, name: str, **kwargs) -> None:
         self.calls.append((name, kwargs))
@@ -216,6 +252,140 @@ class FakeClient:
     def get_docket(self, docket_id):
         self._record("get_docket", docket_id=docket_id)
         return self.docket_details.get(docket_id)
+
+    def get_session_by_code(self, session_code):
+        self._record("get_session_by_code", session_code=session_code)
+        return self.session_details.get(int(session_code))
+
+    def search_legislation(self, **criteria):
+        self._record("search_legislation", **criteria)
+        return list(self.search_results)
+
+    def get_most_frequent_legislation(self, session_id):
+        self._record("get_most_frequent_legislation", session_id=session_id)
+        return list(self.most_viewed)
+
+    def get_legislation_categories(self):
+        self._record("get_legislation_categories")
+        return list(self.categories)
+
+    def get_legislative_numbers(self, session_code=None, session_id=None):
+        self._record("get_legislative_numbers", session_code=session_code)
+        return list(self.legislative_numbers)
+
+    def get_bill_versions_by_id(self, legislation_id=None, *, legislation_ids=None):
+        self._record(
+            "get_bill_versions_by_id",
+            legislation_id=legislation_id,
+            legislation_ids=legislation_ids,
+        )
+        return list(self.bill_versions.get(legislation_id, []))
+
+    def get_amended_legislation(self, *, session_code=None, session_id=None, chamber_code=None):
+        self._record(
+            "get_amended_legislation",
+            session_code=session_code,
+            chamber_code=chamber_code,
+        )
+        return list(self.amended)
+
+    def get_conference_legislation(self, session_id=None, *, chamber_code=None, member_id=None):
+        self._record(
+            "get_conference_legislation",
+            session_id=session_id,
+            chamber_code=chamber_code,
+            member_id=member_id,
+        )
+        return list(self.conference)
+
+    def get_shallow_votes(
+        self,
+        chamber_code,
+        *,
+        session_code=None,
+        session_id=None,
+        legislation_id=None,
+        member_id=None,
+        start_date=None,
+        end_date=None,
+        vote_classification_id=None,
+    ):
+        self._record(
+            "get_shallow_votes",
+            chamber_code=chamber_code,
+            session_code=session_code,
+            legislation_id=legislation_id,
+            start_date=start_date,
+            end_date=end_date,
+        )
+        return list(self.shallow_votes.get(chamber_code, []))
+
+    def get_minutes_books(
+        self,
+        *,
+        session_code=None,
+        session_id=None,
+        committee_id=None,
+        chamber_code=None,
+        start_date=None,
+        end_date=None,
+    ):
+        self._record(
+            "get_minutes_books",
+            session_code=session_code,
+            committee_id=committee_id,
+            chamber_code=chamber_code,
+            start_date=start_date,
+            end_date=end_date,
+        )
+        rows = self.minutes_books
+        if committee_id is not None:
+            rows = [b for b in rows if b.CommitteeID == committee_id]
+
+        if chamber_code is not None:
+            rows = [b for b in rows if b.ChamberCode == chamber_code]
+
+        return list(rows)
+
+    def get_minutes_book(self, minutes_book_id=None, calendar_id=None):
+        self._record("get_minutes_book", minutes_book_id=minutes_book_id)
+        return self.minutes_book_details.get(minutes_book_id)
+
+    def get_communications(self, *, session_code=None, session_id=None, chamber_code=None):
+        self._record("get_communications", session_code=session_code, chamber_code=chamber_code)
+        return [
+            c for c in self.communications if chamber_code is None or c.ChamberCode == chamber_code
+        ]
+
+    def get_communication(self, communication_id=None, **_):
+        self._record("get_communication", communication_id=communication_id)
+        return self.communication_details.get(communication_id)
+
+    def get_personnel(
+        self, *, staff_role_type_id=None, affiliation_id=None, effective_begin_date=None
+    ):
+        self._record(
+            "get_personnel",
+            affiliation_id=affiliation_id,
+            staff_role_type_id=staff_role_type_id,
+        )
+        return list(self.personnel.get(affiliation_id, []))
+
+    def get_contacts(self, owner_id=None, owner_type_id=None):
+        self._record("get_contacts", owner_id=owner_id, owner_type_id=owner_type_id)
+        return list(self.contacts.get(owner_id, []))
+
+    def get_chamber_statistics(self, session_code=None, session_id=None):
+        self._record("get_chamber_statistics", session_code=session_code)
+        return list(self.chamber_statistics)
+
+    def get_committee_statistics(self, chamber_code, *, session_code=None, session_id=None):
+        self._record(
+            "get_committee_statistics",
+            chamber_code=chamber_code,
+            session_code=session_code,
+        )
+        return list(self.committee_statistics.get(chamber_code, []))
 
 
 def call_names(client: FakeClient) -> list[str]:

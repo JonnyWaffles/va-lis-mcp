@@ -6,7 +6,7 @@ import pytest
 from mcp.server.mcpserver.exceptions import ToolError
 from va_lis_client.models import CHIEF_PATRON
 
-from tests.factories import COMMITTEES, ROSTER, SEATS, make_member_bill
+from tests.factories import COMMITTEES, ROSTER, SEATS, make_member_bill, make_office
 from tests.fakes import call_names
 from va_lis_mcp import server
 
@@ -52,6 +52,15 @@ def test_list_members_keeps_departed_members_in_list_name_order(fake_client):
     assert knight["service_end_reason"] == "Deceased"
 
 
+def test_list_members_filters_by_party(fake_client):
+    fake_client.members = ROSTER
+
+    result = server.list_members(20261, party="R")
+
+    assert [m["name"] for m in result["members"]] == ["Barry D. Knight", "Charlie Schmidt"]
+    assert server.list_members(20261, chamber="S", party="R")["count"] == 0
+
+
 def test_get_member_adds_contact_fields(fake_client):
     fake_client.members = ROSTER
 
@@ -68,6 +77,37 @@ def test_get_member_unknown_id(fake_client):
 
     with pytest.raises(ToolError, match="999"):
         server.get_member(999, 20261)
+
+
+def test_get_member_office_reads_the_mailing_contact(fake_client):
+    fake_client.contacts = {
+        # Only contact type 9 is a member's district office.
+        503: [make_office(503, contact_type_id=10), make_office(503)]
+    }
+
+    result = server.get_member_office(503)
+
+    assert result == {
+        "member_id": 503,
+        "found": True,
+        "address": ["P.O. Box 1853"],
+        "city": "Norfolk",
+        "state": "VA",
+        "zip": "23501",
+        "phone": "(757) 204-5492",
+        "email": "DelBAnthony@house.virginia.gov",
+    }
+    # Owner type 3 is a member; the id alone is not enough for LIS.
+    assert fake_client.calls == [("get_contacts", {"owner_id": 503, "owner_type_id": 3})]
+
+
+def test_get_member_office_says_when_lis_holds_none(fake_client):
+    result = server.get_member_office(527)
+
+    assert result["found"] is False
+    assert result["member_id"] == 527
+    assert "get_member" in result["note"]
+    assert "address" not in result
 
 
 MEMBER_BILL_ROWS = {

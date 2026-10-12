@@ -8,10 +8,13 @@ reference joins (roster, statuses), and every cache live in the service; this
 module defines the tools, and :mod:`va_lis_mcp._shaping` turns the models they
 get back into the compact dicts they return.
 
-The tools cover bills (list, detail, summaries, text, history, patrons),
-votes (per bill with the roll call, and per member), members with their
-bills and committee seats, committees with their rosters, and meetings (the
-master schedule, Senate dockets, and floor calendars).
+The tools cover bills (list, keyword search, detail, summaries, text,
+versions, history, patrons, amendments, conferences), votes (per bill with
+the roll call, per member, and per chamber day), members with their bills,
+committee seats, and district offices, committees with their rosters and
+staff, meetings (the master schedule, Senate dockets, and floor calendars),
+chamber records (minutes books and the communications between the chambers),
+and the session statistics LIS publishes.
 
 Run over stdio (the transport MCP hosts launch)::
 
@@ -23,6 +26,7 @@ or serve over HTTP with the ASGI app in :mod:`va_lis_mcp.asgi`.
 from __future__ import annotations
 
 from collections.abc import Callable
+from datetime import date, timedelta
 from typing import Any, Literal
 
 from mcp.server import MCPServer
@@ -39,24 +43,40 @@ from va_lis_client.models import CHIEF_PATRON, PATRON_ROLES, Member
 
 from va_lis_mcp._shaping import (
     RESPONSE_LABELS,
+    compact_amended_bill,
     compact_bill_row,
+    compact_bill_version,
     compact_bill_vote,
+    compact_chamber_statistic,
     compact_committee,
     compact_committee_member,
+    compact_committee_statistic,
+    compact_communication_category,
+    compact_communication_row,
+    compact_conference_bill,
     compact_docket_item,
     compact_meeting,
     compact_member,
     compact_member_bill,
     compact_member_vote,
+    compact_minutes_book,
+    compact_minutes_record,
+    compact_office,
     compact_patron,
+    compact_search_row,
     compact_seat,
     compact_session,
+    compact_session_event,
+    compact_shallow_vote,
+    compact_staff,
     compact_voter,
     condense_patrons,
     docket_header,
     drop_empty,
+    first_row_per_bill,
     iso,
     matches,
+    one_row_per_bill,
     paginate,
     parse_date,
     roll_call_header,
@@ -87,8 +107,10 @@ _PATRON_ROLE_IDS = {name: role_id for role_id, name in PATRON_ROLES.items()}
 
 _INSTRUCTIONS = """\
 Read-only tools for the Virginia General Assembly's Legislative Information
-System (LIS): sessions, bills, summaries, full bill text, action history,
-votes and roll calls, members, committees, and meetings.
+System (LIS): sessions, bills and keyword search, summaries, full bill text
+and versions, action history, votes and roll calls, members, committees,
+meetings, minutes books, communications between the chambers, and session
+statistics.
 
 Identifiers:
 - session_code encodes year + sequence: 20261 = 2026 Regular Session,
@@ -111,10 +133,20 @@ Session semantics:
   (session_code, bill_number); the numeric ID alone is ambiguous across the
   pair. get_bill's "sessions" list is the carry-over lineage record.
 
+Finding bills:
+- list_bills matches a bill's number and short description. search_bills is
+  the full text search over summaries or bill text, and it also filters by
+  stage, patron, and chapter number.
+- A keyword search on its own includes failed bills. With a stage or patron
+  filter LIS leaves out failed and incorporated bills.
+
 Voting records:
 - get_bill_votes lists every vote a bill saw (floor, committee, and
   subcommittee, in both chambers); get_roll_call names the members with party
   and district; get_member_votes is the same record from the member's side.
+- get_bill_vote_tallies is the fast route to a bill's tallies: two requests,
+  no members, and most voice votes missing. list_votes is the same record for
+  one chamber on one day.
 - A block vote is one motion that disposes of many uncontroversial bills at
   once, and a voice vote records no members. Neither is a member's verdict on
   one bill, so get_roll_call leaves them out and get_member_votes flags them
@@ -135,6 +167,17 @@ Meetings:
   blank. Cancelled meetings stay listed with cancelled true.
 - Dockets (committee agendas) exist for Senate committees only; House
   committee agendas are not in the API. Floor calendars cover both chambers.
+
+Chamber records:
+- A minutes book is the clerk's record of what one body did on one day. A
+  vote_id in get_minutes_book belongs to the bill beside it, which a vote_id
+  in get_bill_history does not always do. Both chambers publish committee
+  books; only the Senate publishes floor books.
+- A communication is the formal message one chamber sends the other. It
+  names bills and never votes.
+- get_session_statistics and get_committee_statistics are counts LIS computes
+  itself. They do not always agree with the bill list, so count from
+  list_bills when a number has to be exact.
 
 All data comes from the live LIS REST API and requires the LIS_API_KEY
 environment variable (register at https://lis.virginia.gov/apiregistration).
@@ -190,6 +233,36 @@ def list_sessions(year: int) -> dict[str, Any]:
     return {"year": year, "sessions": [compact_session(s) for s in sessions]}
 
 
+@mcp.tool()
+def get_session(session_code: int) -> dict[str, Any]:
+    """One session with its milestone dates: prefiling, convening, adjournment.
+
+    ``events`` are the dates LIS records for the session, oldest first:
+    "Prefile Date", "Session Start", "Adjournment" (the regular session's
+    sine die), and "Reconvene" (the one day session that takes up the
+    Governor's vetoes and recommendations). ``projected_date`` is the planned
+    date LIS holds for an event.
+    """
+    session = _call(_get_service().client.get_session_by_code, session_code)
+
+    if session is None:
+        raise ToolError(
+            f"No session has code {session_code}. Use list_sessions to find the codes for a year."
+        )
+
+    events = sorted(
+        session.SessionEvents,
+        key=lambda e: (
+            (e.ActualDate or e.ProjectedDate) is None,
+            e.ActualDate or e.ProjectedDate,
+        ),
+    )
+
+    payload = compact_session(session)
+    payload["events"] = [compact_session_event(event) for event in events]
+    return payload
+
+
 # ----------------------------------------------------------------------------
 # Bills
 # ----------------------------------------------------------------------------
@@ -227,6 +300,217 @@ def list_bills(
         "count": len(page),
         "offset": offset,
         "bills": [compact_bill_row(bill) for bill in page],
+    }
+
+
+# structured_output=False: see the note on get_bill_text.
+@mcp.tool(structured_output=False)
+def search_bills(
+    session_code: int,
+    keyword: str | None = None,
+    search_in: Literal["Summary", "Bill Text"] = "Summary",
+    category: str | None = None,
+    member_id: int | None = None,
+    chapter: int | None = None,
+    chamber: Literal["H", "S"] | None = None,
+    include_summaries: bool = False,
+    limit: int = 25,
+    offset: int = 0,
+) -> dict[str, Any]:
+    """Search a session's bills by keyword, stage, patron, or chapter number.
+
+    This is the full text search; list_bills only matches the number and the
+    short description. ``keyword`` searches the summaries, or the bill text
+    when ``search_in`` is "Bill Text", and takes AND, OR, and parentheses
+    ("firearm AND ammunition"). LIS drops common words, so "the" finds
+    nothing. ``category`` is a stage a bill reached, by name: "In Committee",
+    "Passed House", "Continued", "Vetoed", "Acts of Assembly chapters"; an
+    unknown name answers with the full list. ``member_id`` narrows to one
+    patron in any role. ``chapter`` finds the bill behind an Acts of Assembly
+    chapter (350 finds CHAP0350). At least one of the four is required.
+
+    One row per bill, in LIS order, with status, chapter, chief patron, and
+    the committee that holds the bill. ``include_summaries`` adds the plain
+    text of each bill's furthest-along summary. A keyword search on its own
+    includes failed bills; with ``category`` or ``member_id`` LIS leaves out
+    failed and incorporated bills. ``limit`` is capped at 200; page with
+    ``offset``.
+    """
+    keyword = (keyword or "").strip() or None
+
+    if keyword is None and category is None and member_id is None and chapter is None:
+        raise ToolError(
+            "search_bills needs a keyword, a category, a member_id, or a chapter. "
+            "Use list_bills for every bill in a session."
+        )
+
+    service = _get_service()
+    criteria: dict[str, Any] = {"session_code": session_code}
+    if keyword:
+        # LIS answers nothing to a keyword that names no location (verified
+        # live 2026-10-12), so the location always rides along.
+        criteria["keyword"] = keyword
+        criteria["keyword_location"] = search_in
+
+    if category:
+        criteria["category_id"] = _category_id(service, category)
+
+    if member_id is not None:
+        criteria["member_id"] = member_id
+
+    if chapter is not None:
+        criteria["chapter_number"] = f"CHAP{chapter:04d}"
+
+    bills = _call(service.search_bills, **criteria)
+
+    # The chamber is matched here and never sent. Any criterion beside the
+    # keyword makes LIS drop failed and incorporated bills (verified live
+    # 2026-10-12: "firearm" found 50 bills, and the two chambers asked for
+    # one at a time found 37 between them).
+    if chamber:
+        bills = [bill for bill in bills if bill.ChamberCode == chamber]
+
+    page, offset = paginate(bills, limit, offset)
+
+    payload: dict[str, Any] = {"session_code": session_code}
+    if keyword:
+        payload["keyword"] = keyword
+        payload["search_in"] = search_in
+
+    payload.update(
+        {
+            "total_matching": len(bills),
+            "count": len(page),
+            "offset": offset,
+            "bills": [compact_search_row(bill, include_summaries) for bill in page],
+        }
+    )
+
+    if category or member_id is not None:
+        payload["note"] = (
+            "LIS leaves failed and incorporated bills out of a search that names a "
+            "category or a patron. A keyword search on its own includes them, and "
+            "get_member_bills lists every bill a member patrons."
+        )
+    elif keyword and not bills:
+        payload["note"] = (
+            "No bill matched. LIS drops common words from a keyword, and a search of "
+            'the summaries misses a term found only in the bill text (search_in "Bill Text").'
+        )
+
+    return payload
+
+
+@mcp.tool(structured_output=False)
+def list_most_viewed_bills(session_code: int, limit: int = 25) -> dict[str, Any]:
+    """The bills of a session that readers of the LIS website open most often.
+
+    LIS sends at most 100, in its own order, with the same fields as
+    search_bills. The list measures public attention, not legislative weight.
+    """
+    service = _get_service()
+    session_id = _call(service.session_id, session_code)
+    bills = one_row_per_bill(_call(service.client.get_most_frequent_legislation, session_id))
+
+    page, _ = paginate(bills, limit, 0)
+
+    return {
+        "session_code": session_code,
+        "total_matching": len(bills),
+        "count": len(page),
+        "bills": [compact_search_row(bill) for bill in page],
+    }
+
+
+@mcp.tool(structured_output=False)
+def list_amended_bills(
+    session_code: int,
+    amended_by: Literal["H", "S"] | None = None,
+    query: str | None = None,
+    limit: int = 25,
+    offset: int = 0,
+) -> dict[str, Any]:
+    """Every bill in a session that carries an amendment, with its amendments.
+
+    ``amended_by`` picks the chamber that offered the amendments, not the
+    chamber of the bills: "H" returns the bills with a House amendment, Senate
+    bills among them, and only their House amendments. Each amendment has its
+    ``document_code`` (HB1005AH1 is the first House amendment to HB1005), a
+    ``description`` that names the committee or the floor, and a
+    ``disposition`` (Adopted, Not Adopted, Engrossed, Removed, Posted).
+    ``query`` is a case-insensitive substring match against the bill number
+    and description. ``limit`` is capped at 200; page with ``offset``.
+    """
+    rows = _call(
+        _get_service().client.get_amended_legislation,
+        session_code=session_code,
+        chamber_code=amended_by,
+    )
+
+    # LIS repeats a bill once per summary version, with the same amendments
+    # on every copy.
+    bills = first_row_per_bill(rows)
+
+    if query:
+        needle = query.strip().lower()
+        bills = [
+            bill for bill in bills if matches(needle, bill.LegislationNumber, bill.Description)
+        ]
+
+    page, offset = paginate(bills, limit, offset)
+
+    payload: dict[str, Any] = {"session_code": session_code}
+    if amended_by:
+        payload["amended_by"] = amended_by
+
+    payload.update(
+        {
+            "total_matching": len(bills),
+            "count": len(page),
+            "offset": offset,
+            "bills": [compact_amended_bill(bill) for bill in page],
+        }
+    )
+    return payload
+
+
+@mcp.tool(structured_output=False)
+def list_conference_bills(
+    session_code: int,
+    chamber: Literal["H", "S"] | None = None,
+    member_id: int | None = None,
+    limit: int = 50,
+    offset: int = 0,
+) -> dict[str, Any]:
+    """The bills of a session that went to a conference committee.
+
+    A conference committee settles the differences when the two chambers pass
+    different versions of a bill. ``chamber`` is the bill's chamber of origin,
+    and ``member_id`` narrows the list to the conferences one member sat on.
+    The rows name no conferees: get_bill_history lists them on the bill's
+    events ("House Conferees: ..."). ``limit`` is capped at 200; page with
+    ``offset``.
+    """
+    service = _get_service()
+
+    # The endpoint ignores a session code and then answers for every session
+    # back to 1994, so the id is the only safe key.
+    session_id = _call(service.session_id, session_code)
+    bills = _call(
+        service.client.get_conference_legislation,
+        session_id,
+        chamber_code=chamber,
+        member_id=member_id,
+    )
+
+    page, offset = paginate(bills, limit, offset)
+
+    return {
+        "session_code": session_code,
+        "total_matching": len(bills),
+        "count": len(page),
+        "offset": offset,
+        "bills": [compact_conference_bill(bill) for bill in page],
     }
 
 
@@ -316,7 +600,8 @@ def get_bill_summaries(bill_number: str, session_code: int) -> dict[str, Any]:
 # structured_output=False drops the duplicate structuredContent copy: an output
 # schema makes the SDK send the payload twice, and bill text runs to 15,000
 # characters. The same JSON still ships as text in content. The other large
-# payloads (roll calls, voting records, rosters, schedules) do the same.
+# payloads (search results, roll calls, voting records, rosters, schedules,
+# minutes books) do the same.
 @mcp.tool(structured_output=False)
 def get_bill_text(
     bill_number: str,
@@ -362,6 +647,34 @@ def get_bill_text(
         "truncated": truncated,
         "available_versions": versions,
         "text": text,
+    }
+
+
+@mcp.tool()
+def get_bill_versions(bill_number: str, session_code: int) -> dict[str, Any]:
+    """Every published version of a bill, oldest first, with links to its files.
+
+    Introduced, each substitute and amendment, engrossed, enrolled, and
+    chaptered. Each version carries the address of its ``pdf`` and ``html``
+    file and of any fiscal ``impact_statements``. ``chamber`` is the chamber
+    that made the version, not the bill's: a Senate substitute for a House
+    bill says S. ``sponsor`` is who offered it (House, Senate, Committee,
+    Conference, Governor, Member) and ``disposition`` what became of it
+    (Offered, Adopted, Rejected, Posted). Pass a ``document_code`` to
+    get_bill_text to read that version. A chaptered version's code is its
+    chapter number (CHAP0350).
+    """
+    number = _call(normalize_bill_number, bill_number)
+
+    # Only a request for one bill by id fills the file links, which is the
+    # route with_files takes.
+    versions = _call(_get_service().bill_versions, [number], session_code, with_files=True)[number]
+
+    return {
+        "bill_number": number,
+        "session_code": session_code,
+        "count": len(versions),
+        "versions": [compact_bill_version(version) for version in versions],
     }
 
 
@@ -427,7 +740,8 @@ def get_bill_votes(bill_number: str, session_code: int) -> dict[str, Any]:
     a voice vote (no members recorded) and for a block vote (one motion that
     disposed of ``bills_in_vote`` bills at once, which is not a position on
     any one of them). Pass a ``vote_id`` to get_roll_call for the member by
-    member record. Costs one request per vote.
+    member record. Costs one request per vote; get_bill_vote_tallies lists
+    the tallies in two requests when the flags are not needed.
     """
     number = _call(normalize_bill_number, bill_number)
     records = _call(_get_service().bill_votes, number, session_code)
@@ -437,6 +751,80 @@ def get_bill_votes(bill_number: str, session_code: int) -> dict[str, Any]:
         "session_code": session_code,
         "count": len(records),
         "votes": [compact_bill_vote(record) for record in records],
+    }
+
+
+@mcp.tool()
+def get_bill_vote_tallies(bill_number: str, session_code: int) -> dict[str, Any]:
+    """A bill's votes with their tallies and no members, in two requests.
+
+    The fast route to how a bill fared at each stage: committee,
+    subcommittee, and floor votes from both chambers, oldest first. It is
+    lighter than get_bill_votes and it knows less. Most voice votes are
+    missing, there is no pass or fail flag (read ``description`` and
+    ``tally``), and a block vote does not say how many bills it covered. An
+    empty list can mean the bill was decided by voice votes alone.
+    ``referred_to`` names the committee a vote sent the bill on to. Pass a
+    ``vote_id`` to get_roll_call for the members.
+    """
+    number = _call(normalize_bill_number, bill_number)
+    votes = _call(_get_service().bill_shallow_votes, number, session_code)
+
+    return {
+        "bill_number": number,
+        "session_code": session_code,
+        "count": len(votes),
+        "votes": [compact_shallow_vote(vote, include_bill=False) for vote in votes],
+    }
+
+
+@mcp.tool(structured_output=False)
+def list_votes(
+    chamber: Literal["H", "S"],
+    session_code: int,
+    start_date: str,
+    end_date: str | None = None,
+    limit: int = 50,
+    offset: int = 0,
+) -> dict[str, Any]:
+    """Every vote a chamber took in a date range: floor, committee, and subcommittee.
+
+    Dates are ``YYYY-MM-DD`` and inclusive; ``end_date`` defaults to
+    ``start_date``, which gives one day. Keep the range short, since a chamber
+    takes about 50 votes on a session day. ``chamber`` is the chamber that
+    voted, so a row can name a bill from the other chamber. Rows carry the
+    tally and no members: pass a row's ``bill_number`` and ``vote_id`` to
+    get_roll_call for those. A block vote names no bill, most voice votes are
+    missing, and ``classification`` "Attendance" marks a quorum call.
+    ``limit`` is capped at 200; page with ``offset``.
+    """
+    start = _date(start_date, "start_date")
+    end = _date(end_date, "end_date") if end_date else start
+
+    if end < start:
+        raise ToolError("end_date must not be before start_date.")
+
+    votes = _call(
+        _get_service().client.get_shallow_votes,
+        chamber,
+        session_code=session_code,
+        start_date=start,
+        # LIS reads its end date as exclusive; the tool's is inclusive.
+        end_date=end + timedelta(days=1),
+    )
+    votes = sorted(votes, key=lambda v: (v.VoteDate is None, v.VoteDate, v.VoteID))
+
+    page, offset = paginate(votes, limit, offset)
+
+    return {
+        "chamber": chamber,
+        "session_code": session_code,
+        "start_date": start.isoformat(),
+        "end_date": end.isoformat(),
+        "total_matching": len(votes),
+        "count": len(page),
+        "offset": offset,
+        "votes": [compact_shallow_vote(vote) for vote in page],
     }
 
 
@@ -550,8 +938,9 @@ def list_members(
     session_code: int,
     query: str | None = None,
     chamber: Literal["H", "S"] | None = None,
+    party: Literal["D", "R", "I"] | None = None,
 ) -> dict[str, Any]:
-    """The session's member roster, searchable by name.
+    """The session's member roster, searchable by name, chamber, and party.
 
     ``query`` matches any part of a name, ignoring case ("schmidt",
     "Charlie Schmidt", "Schmidt, C"); omit it for the whole roster. The
@@ -571,6 +960,9 @@ def list_members(
     if chamber:
         members = [member for member in members if member.ChamberCode == chamber]
 
+    if party:
+        members = [member for member in members if member.PartyCode == party]
+
     return {
         "session_code": session_code,
         "count": len(members),
@@ -584,8 +976,9 @@ def get_member(member_id: int, session_code: int) -> dict[str, Any]:
 
     Reads the session roster, which is the authoritative source (LIS's by-id
     endpoint answers nothing for some sitting members). Use
-    get_member_committees for seats, get_member_bills for patronage, and
-    get_member_votes for the voting record.
+    get_member_committees for seats, get_member_bills for patronage,
+    get_member_votes for the voting record, and get_member_office for the
+    district office.
     """
     member = _roster_member(_get_service(), member_id, session_code)
 
@@ -599,6 +992,30 @@ def get_member(member_id: int, session_code: int) -> dict[str, Any]:
             "room": member.RoomNumber,
         }
     )
+
+
+@mcp.tool()
+def get_member_office(member_id: int) -> dict[str, Any]:
+    """A member's district office: postal address, phone, and email.
+
+    The district office is the contact detail LIS publishes nowhere else;
+    get_member has the Capitol room, phone, and email. The record is not
+    session scoped, so there is no session code. Many members have no record,
+    and ``found`` is false for them.
+    """
+    office = _call(_get_service().member_office, member_id)
+
+    if office is None:
+        return {
+            "member_id": member_id,
+            "found": False,
+            "note": (
+                "LIS holds no district office for this MemberID. Many sitting members "
+                "have none; get_member has the Capitol room, phone, and email."
+            ),
+        }
+
+    return {"member_id": member_id, "found": True, **compact_office(office)}
 
 
 @mcp.tool(structured_output=False)
@@ -762,6 +1179,30 @@ def get_committee(
             for row in subcommittees
         ]
 
+    return payload
+
+
+@mcp.tool()
+def get_committee_staff(
+    committee: str,
+    chamber: Literal["H", "S"] | None = None,
+) -> dict[str, Any]:
+    """The clerks and staff who serve a committee.
+
+    ``committee`` is a number ("H08", "S13") or any part of a name; pass
+    ``chamber`` or the number when both chambers use the name. ``role`` is
+    Committee Clerk or Committee Staff, the Division of Legislative Services
+    staff assigned to the committee. The list is not session scoped: it names
+    who serves now, and ``since`` is when each assignment began. LIS sends no
+    phone number or email for staff.
+    """
+    service = _get_service()
+    found = _call(service.resolve_committee, committee, chamber)
+    staff = _call(service.committee_staff, found.CommitteeID)
+
+    payload = compact_committee(found)
+    payload["count"] = len(staff)
+    payload["staff"] = [compact_staff(person) for person in staff]
     return payload
 
 
@@ -942,6 +1383,261 @@ def get_floor_calendar(calendar_id: int) -> dict[str, Any]:
 
 
 # ----------------------------------------------------------------------------
+# Chamber records
+# ----------------------------------------------------------------------------
+
+
+@mcp.tool(structured_output=False)
+def list_minutes_books(
+    session_code: int,
+    committee: str | None = None,
+    chamber: Literal["H", "S"] | None = None,
+    kind: Literal["Floor", "Committee"] | None = None,
+    start_date: str | None = None,
+    end_date: str | None = None,
+    limit: int = 50,
+    offset: int = 0,
+) -> dict[str, Any]:
+    """The published minutes books of a session, newest first.
+
+    A minutes book is the clerk's record of what one body did on one day.
+    Both chambers publish committee books. Only the Senate publishes floor
+    books (``is_floor`` true), so read House floor action from
+    list_floor_calendars and get_bill_history. ``committee`` is a number or
+    name, and it excludes every floor book; ``kind`` picks the floor books or
+    the committee books. Dates are ``YYYY-MM-DD`` and inclusive. A book with
+    ``status`` "In Progress" can still change. Pass a ``minutes_book_id`` to
+    get_minutes_book for the bills and votes. ``limit`` is capped at 200;
+    page with ``offset``.
+    """
+    start = _date(start_date, "start_date") if start_date else None
+    end = _date(end_date, "end_date") if end_date else None
+
+    if start and end and end < start:
+        raise ToolError("end_date must not be before start_date.")
+
+    books = _call(
+        _get_service().minutes_books,
+        session_code,
+        committee=committee,
+        chamber_code=chamber,
+        start_date=start,
+        end_date=end,
+    )
+
+    if kind:
+        books = [book for book in books if book.is_floor == (kind == "Floor")]
+
+    books = sorted(
+        books,
+        key=lambda b: (b.MinutesDate is not None, b.MinutesDate, b.MinutesBookID),
+        reverse=True,
+    )
+
+    page, offset = paginate(books, limit, offset)
+
+    return {
+        "session_code": session_code,
+        "total_matching": len(books),
+        "count": len(page),
+        "offset": offset,
+        "books": [compact_minutes_book(book) for book in page],
+    }
+
+
+@mcp.tool(structured_output=False)
+def get_minutes_book(
+    minutes_book_id: int,
+    include_procedural: bool = False,
+    limit: int = 100,
+    offset: int = 0,
+) -> dict[str, Any]:
+    """One minutes book: each action a chamber or committee took that day, in order.
+
+    One record per action, with the bill, the ``section`` of business it fell
+    under, the ``action`` taken, and the ``tally``. A ``vote_id`` here belongs
+    to the bill beside it, which a ``vote_id`` in get_bill_history does not
+    always do: pass it with the bill number and the session code to
+    get_roll_call. The tally keeps a presiding officer's tiebreak ("18-Y
+    18-N 0-A, Chair votes Yea"), which the vote record drops. ``is_block``
+    marks one motion that disposed of many bills, and ``is_voice`` a vote
+    that names no members. ``include_procedural`` adds the entries that name
+    no bill: the call to order, recesses, communications received. A floor
+    day runs to about 200 records; ``limit`` is capped at 200, page with
+    ``offset``.
+    """
+    service = _get_service()
+    book = _call(service.minutes_book, minutes_book_id)
+
+    if book is None:
+        raise ToolError(
+            f"No minutes book has MinutesBookID {minutes_book_id}. "
+            "Use list_minutes_books to find the books of a session."
+        )
+
+    # The book is cached by now, so this second read costs no request.
+    records = _call(service.minutes_records, minutes_book_id, bills_only=not include_procedural)
+
+    # A category's text is the heading the clerk printed ("Senate Bills
+    # Vetoed by Governor"); its description is the generic kind.
+    sections = {
+        category.MinutesCategoryID: category.CategoryText or category.CategoryDescription
+        for category in book.MinutesCategories
+    }
+
+    page, offset = paginate(records, limit, offset)
+
+    payload = compact_minutes_book(book)
+    payload.update(
+        {
+            "total_matching": len(records),
+            "count": len(page),
+            "offset": offset,
+            "records": [
+                compact_minutes_record(record, sections.get(record.entry.MinutesCategoryID))
+                for record in page
+            ],
+        }
+    )
+
+    if not records:
+        payload["note"] = (
+            "LIS holds no records for this book. An older book has only its html file, "
+            "and include_procedural adds the entries that name no bill."
+        )
+
+    return payload
+
+
+@mcp.tool(structured_output=False)
+def list_communications(
+    session_code: int,
+    chamber: Literal["H", "S"] | None = None,
+    limit: int = 50,
+    offset: int = 0,
+) -> dict[str, Any]:
+    """The messages the two chambers sent each other in a session, newest first.
+
+    A communication is the formal notice a clerk sends the other chamber:
+    "The House of Delegates has passed the following Senate bills".
+    ``chamber`` is the chamber that sent it. The rows name no bills; pass a
+    ``communication_id`` to get_communication for those. ``reference`` is
+    unique within one session only. ``limit`` is capped at 200; page with
+    ``offset``.
+    """
+    rows = _call(
+        _get_service().client.get_communications,
+        session_code=session_code,
+        chamber_code=chamber,
+    )
+    rows = sorted(
+        rows,
+        key=lambda r: (r.CommunicationDate is not None, r.CommunicationDate, r.CommunicationID),
+        reverse=True,
+    )
+
+    page, offset = paginate(rows, limit, offset)
+
+    return {
+        "session_code": session_code,
+        "total_matching": len(rows),
+        "count": len(page),
+        "offset": offset,
+        "communications": [compact_communication_row(row) for row in page],
+    }
+
+
+@mcp.tool(structured_output=False)
+def get_communication(communication_id: int) -> dict[str, Any]:
+    """One communication between the chambers: each statement and the bills it names.
+
+    ``statements`` are the clerk's sentences in order ("THE SENATE HAS PASSED
+    THE FOLLOWING HOUSE BILLS:"), each with its bills, their chief patrons,
+    and the ``document_code`` of the text version acted on. A communication
+    records what a chamber did, not how it voted: it carries no vote ids.
+    LIS holds structured content from May 2024 on. An older communication
+    comes back with no statements and an ``html`` link to the original.
+    """
+    detail = _call(_get_service().client.get_communication, communication_id)
+
+    if detail is None:
+        raise ToolError(
+            f"No communication has CommunicationID {communication_id}. "
+            "Use list_communications to find the communications of a session."
+        )
+
+    statements = [compact_communication_category(category) for category in detail.categories]
+
+    payload = compact_communication_row(detail)
+    if detail.SessionCode:
+        payload["session_code"] = int(detail.SessionCode)
+
+    payload["count"] = len(statements)
+    payload["statements"] = statements
+    if not statements:
+        payload["note"] = (
+            "LIS holds no structured content for this communication. Before May 2024 "
+            "the html file is the record."
+        )
+
+    return payload
+
+
+# ----------------------------------------------------------------------------
+# Statistics
+# ----------------------------------------------------------------------------
+
+
+@mcp.tool()
+def get_session_statistics(session_code: int) -> dict[str, Any]:
+    """LIS's own bill counts for a session, by chamber of origin and legislation type.
+
+    One row per chamber and ``type`` (B bill, J joint resolution, R
+    resolution); a type with no bills has no row. ``total`` is ``introduced``
+    plus ``continued_from_last_session``, and ``passed`` counts chaptered
+    plus vetoed bills. LIS computes these counts itself and they do not
+    always agree with the bill list: a total can miss by a bill, the outcome
+    columns add up differently in each session, ``passed_house`` and
+    ``passed_senate`` are not a funnel, and ``continued_to_next_session``
+    overcounts (``pending`` matches the next session). Count from list_bills
+    when a number has to be exact.
+    """
+    rows = _call(_get_service().client.get_chamber_statistics, session_code=session_code)
+
+    return {
+        "session_code": session_code,
+        "count": len(rows),
+        "statistics": [compact_chamber_statistic(row) for row in rows],
+    }
+
+
+@mcp.tool()
+def get_committee_statistics(chamber: Literal["H", "S"], session_code: int) -> dict[str, Any]:
+    """LIS's own referral counts for each standing committee of one chamber.
+
+    ``house_bills`` and ``senate_bills`` split each count by the bill's
+    chamber of origin, so ``senate_bills`` on a House committee counts the
+    Senate bills sent to it after crossover. The counts are referrals, not
+    bills, and the columns do not add up: ``failed`` counts only what the
+    committee itself killed, and ``in_subcommittee`` is a part of
+    ``in_committee``. Subcommittees have no rows. LIS names no bill behind a
+    count; get_bill_history is the record of where one bill went.
+    """
+    rows = _call(
+        _get_service().client.get_committee_statistics,
+        chamber,
+        session_code=session_code,
+    )
+
+    return {
+        "chamber": chamber,
+        "session_code": session_code,
+        "count": len(rows),
+        "committees": [compact_committee_statistic(row) for row in rows],
+    }
+
+
+# ----------------------------------------------------------------------------
 # Diagnostics
 # ----------------------------------------------------------------------------
 
@@ -1041,3 +1737,24 @@ def _roster_member(service: LISService, member_id: int, session_code: int) -> Me
         )
 
     return member
+
+
+def _category_id(service: LISService, name: str) -> int:
+    """The LegislationCategoryID behind a search category name, ignoring case."""
+    categories = _call(service.client.get_legislation_categories)
+    wanted = name.strip().lower()
+
+    for category in categories:
+        if (category.Name or "").lower() == wanted:
+            return category.LegislationCategoryID
+
+    names = ", ".join(sorted(category.Name for category in categories if category.Name))
+    raise ToolError(f"No search category is named {name!r}. The categories are: {names}.")
+
+
+def _date(value: str, name: str) -> date:
+    """A ``YYYY-MM-DD`` argument as a date, or a ToolError that names the argument."""
+    try:
+        return parse_date(value, name)
+    except ValueError as exc:
+        raise ToolError(str(exc)) from exc

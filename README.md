@@ -1,17 +1,15 @@
 # va-lis-mcp
 
 An MCP server for the **Virginia Legislative Information System (LIS) REST
-API**. It exposes the Virginia General Assembly's sessions, bills, summaries,
-full bill text, action history, votes and roll calls, members, committees,
-and meetings to any MCP client (Claude Code, Claude Desktop, and others).
-Every tool is read only. You bring your own LIS API key.
+API**. It exposes the Virginia General Assembly's sessions, bills and keyword
+search, summaries, full bill text and versions, action history, votes and
+roll calls, members, committees, meetings, minutes books, communications
+between the chambers, and session statistics to any MCP client (Claude Code,
+Claude Desktop, and others). Every tool is read only. You bring your own LIS
+API key.
 
 Built on [va-lis-client](https://pypi.org/project/va-lis-client/), a Python
 client for the LIS API.
-
-> **Status: not yet on PyPI.** The `uvx va-lis-mcp` snippets below are written
-> for the first release. Until then, install from a source checkout (see
-> [Installing from source](#installing-from-source)).
 
 ## Requirements
 
@@ -59,7 +57,7 @@ Add this to the client's MCP configuration (for Claude Desktop that is
 
 ### Installing from source
 
-Until the first PyPI release, point the client at a checkout instead:
+To run the server from a checkout, point the client at it instead:
 
 ```bash
 git clone https://github.com/JonnyWaffles/va-lis-mcp
@@ -81,11 +79,17 @@ name.
 |---|---|---|
 | `get_current_session` | none | The GA's working session, with a note on what "current" means during the interim |
 | `list_sessions` | `year` | Sessions for a calendar year with their codes (reference data reaches back to 1994) |
+| `get_session` | `session_code` | One session with its milestone dates: prefiling, convening, adjournment, and the reconvened session |
 | `list_bills` | `session_code`, `query?`, `limit?`, `offset?` | Bill rows filtered by a substring match on number, description, and title; paginated, with a total match count |
+| `search_bills` | `session_code`, `keyword?`, `search_in?`, `category?`, `member_id?`, `chapter?`, `chamber?`, `include_summaries?`, `limit?`, `offset?` | Full text search over summaries or bill text, with filters for the stage a bill reached, a patron, and an Acts of Assembly chapter number; one row per bill with status, chapter, committee, and chief patron |
+| `list_most_viewed_bills` | `session_code`, `limit?` | The bills readers of the LIS website open most often, at most 100 |
+| `list_amended_bills` | `session_code`, `amended_by?`, `query?`, `limit?`, `offset?` | Every bill that carries an amendment, with each amendment's document code, chamber, and disposition; paginated |
+| `list_conference_bills` | `session_code`, `chamber?`, `member_id?`, `limit?`, `offset?` | The bills that went to a conference committee, for the session or for one conferee; paginated |
 | `get_bill` | `bill_number`, `session_code` | Full bill detail: title, status, dates, patrons grouped by role, and the session lineage list |
 | `get_bill_patrons` | `bill_number`, `session_code` | Every patron with member id, role, and chamber, in LIS display order |
 | `get_bill_summaries` | `bill_number`, `session_code` | Plain text summaries (as introduced, as passed); the active entry is the current one |
 | `get_bill_text` | `bill_number`, `session_code`, `document_code?` | Plain text of one version (default: most recent), truncated at 15,000 characters, plus the list of available versions |
+| `get_bill_versions` | `bill_number`, `session_code` | Every published version with its chamber, sponsor, and disposition, and the links to its PDF, HTML, and fiscal impact statements |
 | `get_bill_history` | `bill_number`, `session_code` | Chronological events with date, description, actor, committee, vote tally, `vote_id`, status, and passage flags |
 
 ### Votes
@@ -93,6 +97,8 @@ name.
 | Tool | Inputs | Returns |
 |---|---|---|
 | `get_bill_votes` | `bill_number`, `session_code` | Every vote the bill saw in either chamber (floor, committee, subcommittee) with tally, outcome, and the voice, block, and roll call flags |
+| `get_bill_vote_tallies` | `bill_number`, `session_code` | The same votes in two requests: tallies and no members, with most voice votes missing |
+| `list_votes` | `chamber`, `session_code`, `start_date`, `end_date?`, `limit?`, `offset?` | Every vote one chamber took in a date range, with the bill and the tally; paginated |
 | `get_roll_call` | `bill_number`, `session_code`, `vote_id?` | Members grouped as yea, nay, abstain, and not voting, each with party and district, plus any vote statements; voice and block votes are left out |
 | `get_member_votes` | `member_id`, `session_code`, `bill_number?`, `exclude_block_votes?`, `limit?`, `offset?` | One member's votes across a session or on one bill, with block votes flagged; paginated |
 
@@ -100,8 +106,9 @@ name.
 
 | Tool | Inputs | Returns |
 |---|---|---|
-| `list_members` | `session_code`, `query?`, `chamber?` | The session roster, searchable by any part of a name, departed members included |
+| `list_members` | `session_code`, `query?`, `chamber?`, `party?` | The session roster, searchable by any part of a name, departed members included |
 | `get_member` | `member_id`, `session_code` | One roster record with party, district, status, and contact details |
+| `get_member_office` | `member_id` | The member's district office: postal address, phone, and email, when LIS holds one |
 | `get_member_bills` | `member_id`, `session_code`, `role?`, `query?`, `limit?`, `offset?` | Every bill the member patrons, with chief patronage flagged; paginated |
 | `get_member_committees` | `member_id`, `session_code`, `include_subcommittees?` | The member's committee seats and roles |
 
@@ -111,6 +118,7 @@ name.
 |---|---|---|
 | `list_committees` | `chamber?`, `include_subcommittees?` | The standing committees, with subcommittees on request |
 | `get_committee` | `committee`, `session_code`, `chamber?` | The committee's roster for the session with each member's role, party, and district, its regular meeting note, and its subcommittees |
+| `get_committee_staff` | `committee`, `chamber?` | The clerks and staff who serve the committee, with the date each assignment began |
 
 ### Meetings
 
@@ -120,6 +128,22 @@ name.
 | `list_dockets` | `committee`, `session_code` | A Senate committee's dockets with the bills on each (the House keeps none) |
 | `list_floor_calendars` | `chamber`, `session_code` | A chamber's floor calendars for the session |
 | `get_floor_calendar` | `calendar_id` | The bills on one floor calendar by section, with the actions and vote ids recorded against each |
+
+### Chamber records
+
+| Tool | Inputs | Returns |
+|---|---|---|
+| `list_minutes_books` | `session_code`, `committee?`, `chamber?`, `kind?`, `start_date?`, `end_date?`, `limit?`, `offset?` | The published minutes books of a session, newest first, with floor books marked; paginated |
+| `get_minutes_book` | `minutes_book_id`, `include_procedural?`, `limit?`, `offset?` | Each action a chamber or committee took that day, with the bill, the tally, and a `vote_id` that belongs to that bill; paginated |
+| `list_communications` | `session_code`, `chamber?`, `limit?`, `offset?` | The messages the two chambers sent each other, newest first; paginated |
+| `get_communication` | `communication_id` | One communication: each statement of the clerk and the bills it names |
+
+### Statistics
+
+| Tool | Inputs | Returns |
+|---|---|---|
+| `get_session_statistics` | `session_code` | LIS's own bill counts by chamber of origin and legislation type: introduced, passed, failed, continued, and more |
+| `get_committee_statistics` | `chamber`, `session_code` | LIS's own referral counts for each standing committee, split by the bill's chamber of origin |
 
 ### Diagnostics
 
@@ -181,6 +205,37 @@ full reference for LIS behavior.
   `list_meetings` gives the meeting, the bill's history gives the referral,
   and the agenda itself lives on the committee's web page. Schedule times are
   free text as the clerk entered them and may be blank.
+- **Two ways to find a bill.** `list_bills` matches the number and the short
+  description of every bill in a session. `search_bills` is the full text
+  search over summaries or bill text. LIS drops common words from a keyword,
+  so a word such as "the" finds nothing.
+- **A filtered search hides failed bills.** A keyword search on its own
+  includes them. Once the search names a stage or a patron, LIS leaves out
+  failed and incorporated bills (measured in October 2026). The tool matches
+  the chamber itself for that reason, and the response says so when the gap
+  applies.
+- **A minutes book is the safe way in to a roll call.** A `vote_id` on a
+  bill's history can point at a vote that disposed of some other bill. A
+  `vote_id` in `get_minutes_book` belongs to the bill beside it. The minutes
+  tally also keeps a presiding officer's tiebreak, which the vote record
+  drops.
+- **Only the Senate publishes floor minutes.** Both chambers publish
+  committee books. For House floor action, read `list_floor_calendars` and
+  `get_bill_history`.
+- **A communication names bills, never votes.** It is the formal message one
+  chamber's clerk sends the other. Structured content starts in May 2024; an
+  older communication is an HTML file and nothing more.
+- **The fast vote list knows less.** `get_bill_vote_tallies` and `list_votes`
+  cost one request per chamber, however many votes there are. They leave out
+  most voice votes, carry no pass or fail flag, and do not say how many bills
+  a block vote covered. `get_bill_votes` has all three.
+- **LIS's statistics are its own arithmetic.** The session and committee
+  counts name no bill, and they do not always agree with the bill list. A
+  total can miss by a bill, and the committee counts are referrals, not
+  bills. Count from `list_bills` when a number has to be exact.
+- **Staff and offices are not session scoped.** `get_committee_staff` names
+  who serves a committee now. `get_member_office` reads the district office,
+  and many members have none on record.
 
 ## Embedding in an ASGI app
 
